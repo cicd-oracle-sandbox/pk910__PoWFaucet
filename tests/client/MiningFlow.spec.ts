@@ -1,0 +1,125 @@
+import 'mocha';
+import { expect } from 'chai';
+import type { Browser, Page } from 'playwright';
+import { bootFaucet, IFaucetFixture, launchBrowser, openFaucet, startMiningSession, waitForShare, TEST_TARGET_ADDR } from './harness.js';
+import { ServiceManager } from '../../src/common/ServiceManager.js';
+import { SessionManager } from '../../src/session/SessionManager.js';
+import { ModuleManager } from '../../src/modules/ModuleManager.js';
+
+/**
+ * The whole user journey in one browser: start a session, mine until a share came in, stop, claim,
+ * see the transaction confirmed. The hashers are the real wasm workers in chromium; the pow module
+ * runs with a difficulty that makes a share a matter of seconds.
+ */
+describe("browser: mining flow", function() {
+  this.timeout(120000);
+  let browser: Browser | null = null;
+  let skipReason: string | null = null;
+  let fixture: IFaucetFixture | null = null;
+  let page: Page | null = null;
+
+  before(async () => {
+    ({ browser, skipReason } = await launchBrowser());
+  });
+  after(async () => {
+    if(browser)
+      await browser.close();
+  });
+  afterEach(async () => {
+    if(page) { await page.close(); page = null; }
+    if(fixture) { await fixture.dispose(); fixture = null; }
+  });
+
+  it("starts a session, mines a share, stops, claims and sees the confirmation", async function() {
+    if(skipReason) return this.skip();
+    fixture = await bootFaucet();
+    page = await browser.newPage();
+    let pageErrors: string[] = [];
+    page.on("pageerror", (err) => pageErrors.push(err.stack || ("" + err)));
+
+    // start; the mining page is up and connected when this returns
+    let sessionId = await startMiningSession(page, fixture);
+    expect(sessionId, "no session id in the mining url").to.be.a("string");
+
+    // mining page: the status block and the stop button
+    expect(await page.getByText(TEST_TARGET_ADDR).count()).to.be.greaterThan(0, "target address not shown");
+    let stopButton = page.getByRole("button", { name: /^Stop Mining/ });
+    await stopButton.waitFor();
+
+    // the workers hash and a share arrives: the server-side balance moves above zero
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    await page.waitForFunction(() => {
+      let hashrate = Array.from(document.querySelectorAll("*")).map((el) => el.textContent || "").find((t) => /\d+(\.\d+)? H\/s/.test(t) && !/^0 H\/s/.test(t.trim()));
+      return !!hashrate;
+    }, null, { timeout: 60000 });
+    await waitForShare(sessionId);
+    expect(sessionManager.getSession(sessionId).getDropAmount() > 0n).to.equal(true, "no share rewarded within a minute");
+
+    // the stop button learned about the balance
+    await page.getByRole("button", { name: "Stop Mining & Claim Rewards" }).waitFor({ timeout: 30000 });
+    await page.getByRole("button", { name: "Stop Mining & Claim Rewards" }).click();
+    await page.waitForURL(/#\/claim\//, { timeout: 30000 });
+
+    // claim page
+    await page.getByText("Claim Rewards").first().waitFor({ timeout: 30000 });
+    await page.getByText(TEST_TARGET_ADDR).first().waitFor({ timeout: 30000 });
+    await page.getByRole("button", { name: "Claim Rewards" }).click();
+
+    // the stubbed chain confirms at once
+    await page.getByText(/Claim Transaction has been confirmed/).waitFor({ timeout: 30000 });
+    let explorerLink = page.locator('a[href="https://explorer.test/tx/0x' + "ab".repeat(32) + '"]');
+    let statusJson = await page.evaluate(async (id) => (await fetch("/api/getSessionStatus?session=" + id)).text(), sessionId);
+    expect(await explorerLink.count()).to.equal(1, "tx hash should link to the explorer; session status: " + statusJson);
+    expect(await explorerLink.innerText()).to.equal("0x" + "ab".repeat(32), "the link text is the tx hash");
+
+    expect(pageErrors, "javascript errors on the page: " + pageErrors.join("; ")).to.have.length(0);
+  });
+
+  it("mines a share with the yespower worker", async function() {
+    if(skipReason) return this.skip();
+    fixture = await bootFaucet({
+      configure: (config) => {
+        Object.assign(config.modules["pow"], {
+          powHashAlgo: "yespower",
+          powYespowerParams: { N: 1024, r: 8, pers: "PoWFaucet" },
+        });
+      },
+    });
+    page = await browser.newPage();
+    let pageErrors: string[] = [];
+    let consoleErrors: string[] = [];
+    page.on("pageerror", (err) => pageErrors.push(err.stack || ("" + err)));
+    page.on("console", (msg) => { if(msg.type() === "error") consoleErrors.push(msg.text()); });
+    let workerScripts: string[] = [];
+    page.on("request", (req) => { if(/powfaucet-worker-/.test(req.url())) workerScripts.push(req.url()); });
+
+    let sessionId = await startMiningSession(page, fixture);
+    expect(sessionId, "no session id in the mining url").to.be.a("string");
+
+    // the share is validated server side with the same yespower params, so a reward proves both ends agree
+    await waitForShare(sessionId);
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    expect(sessionManager.getSession(sessionId).getDropAmount() > 0n).to.equal(true, "no yespower share rewarded");
+    expect(ServiceManager.GetService(ModuleManager).getModule("pow").getModuleConfig()["powHashAlgo"]).to.equal("yespower", "faucet not running yespower");
+    expect(workerScripts.length).to.be.greaterThan(0, "no miner worker loaded");
+    expect(workerScripts.every((url) => /powfaucet-worker-yp\.js/.test(url)), "unexpected worker scripts: " + workerScripts.join(", ")).to.equal(true);
+
+    expect(pageErrors, "javascript errors on the page: " + pageErrors.join("; ")).to.have.length(0);
+    expect(consoleErrors.filter((msg) => /hashing failed/.test(msg)), "worker reported hashing failures").to.have.length(0);
+  });
+
+  it("refuses an invalid address with a dialog and stays on the front page", async function() {
+    if(skipReason) return this.skip();
+    fixture = await bootFaucet();
+    page = await browser.newPage();
+    await openFaucet(page, fixture);
+
+    await page.getByPlaceholder(/ETH address/).fill("not-an-address");
+    await page.getByRole("button", { name: "Start Mining" }).click();
+
+    let dialog = page.getByRole("dialog");
+    await dialog.waitFor({ timeout: 30000 });
+    expect(await dialog.innerText()).to.contain("Could not start session");
+    expect(page.url()).to.not.match(/#\/mine\//);
+  });
+});

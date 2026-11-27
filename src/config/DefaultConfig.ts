@@ -1,0 +1,85 @@
+import { FaucetDbDriver } from "../db/FaucetDatabase.js";
+import { FaucetCoinType } from "../eth/EthWalletManager.js";
+import { IConfigSchema } from "./ConfigSchema.js";
+import { resolveRelativePath } from "./FaucetConfig.js";
+
+export function getDefaultConfig(): IConfigSchema {
+  return {
+    version: 2,
+
+    appBasePath: null,
+    faucetVersion: "",
+    staticPath: resolveRelativePath("~app/static"),
+    faucetPidFile: null, // path to file to write the process pid to
+
+    buildSeoIndex: true,
+    // off: a faucet that has never asked for a shared-memory worker should not have its captcha
+    // broken by a header it did not ask for
+    crossOriginIsolation: "off",
+    buildSeoMeta: {},
+    database: {
+      driver: FaucetDbDriver.SQLITE,
+      file: resolveRelativePath("faucet-store.db"),
+    },
+
+    faucetTitle: "Test Faucet",
+    faucetImage: "/images/fauceth_420.jpg",
+    faucetHomeHtml: "",
+    faucetCoinSymbol: "ETH",
+    faucetCoinType: FaucetCoinType.NATIVE,
+    faucetCoinContract: null,
+    faucetLogFile: null,
+    faucetLogStatsInterval: 600,
+    serverPort: 8080,
+    httpProxyCount: 0,
+    faucetSecret: null, // mandatory
+
+    ethRpcHost: null, // mandatory
+    ethRpcMaxBlockHeightDiff: 10,
+    ethRpcMonitorInterval: 10,
+    ethRpcMonitorMeteredInterval: 60,
+    ethTxBroadcastCount: 2,
+    ethWalletKey: null, // mandatory
+    ethChainId: null,
+    ethTxGasLimit: 250000, // must cover new-account state-creation gas (~207k on EIP-8037 chains)
+    ethLegacyTx: false,
+    ethTxMaxFee: 100000000000,
+    ethTxPrioFee: 2000000000,
+    ethTxFeeCap: 1000000000000000000, // geth's default --rpc.txfeecap
+    ethMaxPending: 20,
+    ethQueueNoFunds: false,
+    ethTxExplorerLink: null,
+
+    maxDropAmount: 1000000000000000000, // 1 ETH
+    minDropAmount: 10000000000000000, // 0.01 ETH
+    sessionTimeout: 86400,
+    sessionCleanup: 2592000,
+    sessionSaveTime: 120,
+
+    modules: {},
+
+    spareFundsAmount: 10000000000000000, // 0.01 ETH
+    noFundsBalance: 100000000000000000, // 0.1 ETH
+    lowFundsBalance: 10000000000000000000, // 10 ETH
+    lowFundsWarning: true,
+    noFundsError: true,
+    rpcConnectionError: true,
+    denyNewSessions: false,
+    corsAllowOrigin: [],
+    ethClaimTx: null,
+    ethClaimBatch: null,
+    ethIgnoreDelegate: false,
+    ethRefillContract: null,
+    faucetStats: null,
+    faucetStatus: {
+      json: "faucet-status.json",
+      yaml: "faucet-status.yaml",
+    },
+    resultSharing: {
+      preHtml: '<div class="sh-opt">Do you like the faucet? Give that project a <iframe src="https://ghbtns.com/github-btn.html?user=pk910&repo=PoWFaucet&type=star&count=true" frameborder="0" scrolling="0" width="150" height="20" title="GitHub"></iframe></div>',
+      postHtml: '',
+      caption: null,
+    },
+  };
+}
+

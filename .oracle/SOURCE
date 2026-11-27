@@ -1,0 +1,4 @@
+upstream: https://github.com/pk910/PoWFaucet
+commit: 1b3282370c3b0f45f18ae27d426bbfbc5bc1aa2d
+license: AGPL-3.0
+Unmodified snapshot except that .github/workflows was emptied.

@@ -1,0 +1,25 @@
+.nyc_output/
+bin/
+build/
+bundle/
+coverage/
+dist/
+dist-test/
+# `npm run sdk` output: a plugin build needs it on disk, and a generated tree in the
+# repository drifts against the source it came from
+sdk-dist/
+node_modules/
+static/index.seo.html
+static/css/powfaucet*
+static/js/powfaucet*
+faucet-config.json
+faucet-config.yaml
+faucet-status.json
+faucet-status.yaml
+faucet-store.*
+faucet-stats.log
+faucet-events.log
+faucet-pid.txt
+tmp*
+# module packages are separate repositories dropped in here (private modules included); never tracked
+/modules/

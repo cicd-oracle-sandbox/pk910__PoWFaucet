@@ -1,0 +1,479 @@
+import 'mocha';
+import sinon from 'sinon';
+import path from 'path';
+import os from 'os';
+import { expect } from 'chai';
+import { bindTestStubs, unbindTestStubs, loadDefaultTestConfig, awaitSleepPromise } from './common.js';
+import { ServiceManager } from '../src/common/ServiceManager.js';
+import { FaucetDatabase, FaucetDbDriver } from '../src/db/FaucetDatabase.js';
+import { ModuleHookAction, ModuleManager } from '../src/modules/ModuleManager.js';
+import { SessionManager } from '../src/session/SessionManager.js';
+import { faucetConfig } from '../src/config/FaucetConfig.js';
+import { FaucetError } from '../src/common/FaucetError.js';
+import { FaucetSession, FaucetSessionStatus } from '../src/session/FaucetSession.js';
+import { FaucetProcess } from '../src/common/FaucetProcess.js';
+
+
+describe("Faucet Session Management", () => {
+  let globalStubs;
+
+  beforeEach(async () => {
+    globalStubs = bindTestStubs();
+    loadDefaultTestConfig();
+    faucetConfig.database = {
+      driver: FaucetDbDriver.SQLITE,
+      file: path.join(os.tmpdir(), "powfaucet-test.sqlite"),
+    };
+    await ServiceManager.GetService(FaucetDatabase).initialize();
+    await ServiceManager.GetService(ModuleManager).initialize();
+  });
+  afterEach(async () => {
+    let dbService = ServiceManager.GetService(FaucetDatabase);
+    await ServiceManager.DisposeAllServices();
+    await dbService.dropAllTables();
+    await dbService.closeDatabase();
+    await unbindTestStubs(globalStubs);
+  });
+
+  it("Create normal session", async () => {
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let now = Math.floor(new Date().getTime() / 1000);
+    let testSession = await sessionManager.createSession("::ffff:8.8.8.8", { addr: "0x0000000000000000000000000000000000001337" });
+    expect(testSession).to.not.equal(null, "createSession failed");
+    expect(testSession.getRemoteIP()).to.equal("8.8.8.8", "unexpected remoteIP");
+    expect(testSession.getTargetAddr()).to.equal("0x0000000000000000000000000000000000001337", "unexpected targetAddr");
+    expect(Math.abs(testSession.getStartTime() - now)).to.be.lessThan(2, "unexpected startTime");
+    expect(testSession.getBlockingTasks().length).to.equal(0, "unexpected blockingTasks");
+    expect(testSession.getSessionStatus()).to.equal("claimable", "unexpected session status");
+    expect(testSession.getDropAmount()).to.equal(BigInt(faucetConfig.maxDropAmount), "unexpected drop amount");
+  });
+
+  it("Create invalid session (missing addr)", async () => {
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let error: FaucetError | null = null;
+    try {
+      await sessionManager.createSession("8.8.8.8", { });
+    } catch(ex) { error = ex; }
+    expect(error).to.not.equal(null, "no exception thrown");
+    expect(error instanceof FaucetError).to.equal(true, "unexpected error type");
+    expect(error?.getCode()).to.equal("INVALID_ADDR", "unexpected error code");
+  });
+
+  describe("the module a session is started for", () => {
+    // `module` + `params` are the whole of the core's module vocabulary: a name it
+    // can resolve, and a flat map of strings it stores without reading. They replaced two fields
+    // named after one module's subject matter, in a core type, that only that module ever read.
+    const ADDR = "0x0000000000000000000000000000000000001337";
+
+    beforeEach(async () => {
+      // any real module will do - the core's rule is about the *name* resolving, not about what the
+      // module does. The reload listener is how a running faucet picks up a config change, so it is
+      // also how a spec adds a module after `initialize()`.
+      faucetConfig.modules["whitelist"] = {
+        enabled: true,
+        whitelistPattern: {},
+        whitelistFile: null,
+      } as any;
+      ServiceManager.GetService(FaucetProcess).emit("reload");
+      await ServiceManager.GetService(ModuleManager).getLoadingPromise();
+    });
+
+    it("stores the parameters under the module's own session-data key", async () => {
+      let session = await ServiceManager.GetService(SessionManager).createSession("8.8.8.8", {
+        addr: ADDR, module: "whitelist", params: { mode: "only", level: "3" },
+      });
+      expect(session.getSessionStatus()).to.not.equal(FaucetSessionStatus.FAILED, "session did not start");
+      let params = session.getSessionData<Record<string, string>>("whitelist.params", null);
+      expect(!!params).to.equal(true, "no params were stored");
+      expect(params.mode).to.equal("only", "unexpected mode");
+      // the core knows neither key: it carries what the panel sent
+      expect(params.level).to.equal("3", "unexpected level");
+    });
+
+    it("starts a plain session when there is neither", async () => {
+      let session = await ServiceManager.GetService(SessionManager).createSession("8.8.8.8", { addr: ADDR });
+      expect(session.getSessionStatus()).to.not.equal(FaucetSessionStatus.FAILED, "session did not start");
+      expect(session.getSessionData("whitelist.params", null)).to.equal(null, "params were invented");
+    });
+
+    it("refuses an unknown module, and names it", async () => {
+      let error: FaucetError | null = null;
+      try {
+        await ServiceManager.GetService(SessionManager).createSession("8.8.8.8", {
+          addr: ADDR, module: "not-installed-here", params: { mode: "only" },
+        });
+      } catch(ex) { error = ex; }
+      expect(error).to.not.equal(null, "no exception thrown");
+      expect(error?.getCode()).to.equal("INVALID_MODULE", "unexpected error code");
+      // the only useful answer says which name failed: a client that sends a module this faucet does
+      // not have is usually talking to the wrong faucet, and "invalid request" sends nobody anywhere
+      expect(error?.message.indexOf("not-installed-here") !== -1).to.equal(true,
+        "the error does not name the module: " + error?.message);
+    });
+
+    it("refuses parameters that name no module", async () => {
+      let error: FaucetError | null = null;
+      try {
+        await ServiceManager.GetService(SessionManager).createSession("8.8.8.8", {
+          addr: ADDR, params: { mode: "only" },
+        });
+      } catch(ex) { error = ex; }
+      expect(error?.getCode()).to.equal("INVALID_PARAMS", "unexpected error code");
+    });
+
+    it("refuses a parameter that is not a string", async () => {
+      let error: FaucetError | null = null;
+      try {
+        await ServiceManager.GetService(SessionManager).createSession("8.8.8.8", {
+          addr: ADDR, module: "whitelist", params: { level: 3 },
+        });
+      } catch(ex) { error = ex; }
+      expect(error?.getCode()).to.equal("INVALID_PARAMS", "unexpected error code");
+      expect(error?.message.indexOf("level") !== -1).to.equal(true,
+        "the error does not name the parameter: " + error?.message);
+    });
+  });
+
+  it("Create invalid session (invalid addr)", async () => {
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let error: FaucetError | null = null;
+    try {
+      await sessionManager.createSession("8.8.8.8", { addr: "not_a_eth_address" });
+    } catch(ex) { error = ex; }
+    expect(error).to.not.equal(null, "no exception thrown");
+    expect(error instanceof FaucetError).to.equal(true, "unexpected error type");
+    expect(error?.getCode()).to.equal("INVALID_ADDR", "unexpected error code");
+  });
+
+  it("stores the target address in lower case, whatever its spelling", async () => {
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let testSession = await sessionManager.createSession("8.8.8.8", { addr: "0x00000000000000000000000000000000000ABCDE" });
+    expect(testSession.getTargetAddr()).to.equal("0x00000000000000000000000000000000000abcde", "unexpected targetAddr");
+    let storedSession = await ServiceManager.GetService(FaucetDatabase).getSession(testSession.getSessionId());
+    expect(storedSession.targetAddr).to.equal("0x00000000000000000000000000000000000abcde", "unexpected stored targetAddr");
+    // the same account spelled differently is not a change of the target address
+    testSession.setTargetAddr("0x00000000000000000000000000000000000AbCdE");
+    expect(testSession.getTargetAddr()).to.equal("0x00000000000000000000000000000000000abcde", "targetAddr changed by another spelling");
+    let error: FaucetError | null = null;
+    try {
+      testSession.setTargetAddr("0x00000000000000000000000000000000000abcdf");
+    } catch(ex) { error = ex; }
+    expect(error?.getCode()).to.equal("INVALID_STATE", "another address was accepted on a session that has one");
+  });
+
+  it("restores a stored mixed-case target address in lower case", async () => {
+    faucetConfig.sessionTimeout = 10;
+    let now = Math.floor(new Date().getTime() / 1000);
+    await ServiceManager.GetService(FaucetDatabase).updateSession({
+      sessionId: "4e63566e-e482-46f3-bb91-da11f511aae6",
+      status: FaucetSessionStatus.RUNNING,
+      startTime: now,
+      targetAddr: "0x00000000000000000000000000000000000ABCDE",
+      dropAmount: "1337",
+      remoteIP: "8.8.8.8",
+      tasks: [],
+      data: {},
+      claim: null,
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    await sessionManager.initialize();
+    let testSession = sessionManager.getSession("4e63566e-e482-46f3-bb91-da11f511aae6", [FaucetSessionStatus.RUNNING]);
+    expect(testSession).to.not.equal(undefined, "getSession failed");
+    expect(testSession.getTargetAddr()).to.equal("0x00000000000000000000000000000000000abcde", "unexpected targetAddr");
+  });
+
+  it("lower-cases the stored target addresses when upgrading the schema", async () => {
+    let faucetDb = ServiceManager.GetService(FaucetDatabase);
+    let now = Math.floor(new Date().getTime() / 1000);
+    await faucetDb.updateSession({
+      sessionId: "4e63566e-e482-46f3-bb91-da11f511aae7",
+      status: FaucetSessionStatus.FINISHED,
+      startTime: now,
+      targetAddr: "0x00000000000000000000000000000000000ABCDE",
+      dropAmount: "1337",
+      remoteIP: "8.8.8.8",
+      tasks: [],
+      data: {},
+      claim: null,
+    });
+    await faucetDb.getDatabase().run("UPDATE SchemaVersion SET Version = 1 WHERE Module IS NULL");
+    await (faucetDb as any).upgradeSchema();
+    let storedSession = await faucetDb.getSession("4e63566e-e482-46f3-bb91-da11f511aae7");
+    expect(storedSession.targetAddr).to.equal("0x00000000000000000000000000000000000abcde", "stored targetAddr not lower-cased");
+    let versionRow = await faucetDb.getDatabase().get("SELECT Version FROM SchemaVersion WHERE Module IS NULL") as {Version: number};
+    expect(versionRow.Version).to.equal(2, "unexpected schema version");
+  });
+
+  it("Create session with blocking task", async () => {
+    faucetConfig.minDropAmount = 1000;
+    ServiceManager.GetService(ModuleManager).addActionHook(null, ModuleHookAction.SessionStart, 100, "test-task", (session: FaucetSession, userInput: any) => {
+      session.addBlockingTask("test", "test", 1);
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let now = Math.floor(new Date().getTime() / 1000);
+    let testSession = await sessionManager.createSession("8.8.8.8", { addr: "0x0000000000000000000000000000000000001337" });
+    expect(testSession).to.not.equal(null, "createSession failed");
+    expect(testSession.getRemoteIP()).to.equal("8.8.8.8", "unexpected remoteIP");
+    expect(testSession.getTargetAddr()).to.equal("0x0000000000000000000000000000000000001337", "unexpected targetAddr");
+    expect(Math.abs(testSession.getStartTime() - now)).to.be.lessThan(2, "unexpected startTime");
+    expect(testSession.getBlockingTasks().length).to.equal(1, "unexpected blockingTasks");
+    expect(testSession.getSessionStatus()).to.equal(FaucetSessionStatus.RUNNING, "unexpected session status");
+    await testSession.addReward(1337n);
+    expect(testSession.getDropAmount()).to.equal(1337n, "unexpected drop amount after addReward()");
+    await testSession.subPenalty(10n);
+    expect(testSession.getDropAmount()).to.equal(1327n, "unexpected drop amount after subPenalty()");
+    let runningSession = sessionManager.getSession(testSession.getSessionId(), [FaucetSessionStatus.RUNNING]);
+    expect(runningSession === testSession).to.equal(true, "sessionManager.getSession did not return running session (running state)");
+    let runningSession2 = sessionManager.getSession(testSession.getSessionId());
+    expect(runningSession2 === testSession).to.equal(true, "sessionManager.getSession did not return running session (stateless)");
+    await awaitSleepPromise(4000, () => testSession.getSessionStatus() === FaucetSessionStatus.CLAIMABLE);
+    expect(testSession.getSessionStatus()).to.equal(FaucetSessionStatus.CLAIMABLE, "unexpected session status");
+    testSession.setDropAmount(42n); // this may not work anymore as the balance is already set
+    expect(testSession.getDropAmount()).to.equal(1327n, "unexpected drop amount after setDropAmount()");
+  }).timeout(5000);
+
+  it("Create invalid session (amount too low)", async () => {
+    faucetConfig.minDropAmount = 1000;
+    ServiceManager.GetService(ModuleManager).addActionHook(null, ModuleHookAction.SessionStart, 100, "test-task", (session: FaucetSession, userInput: any) => {
+      session.setDropAmount(500n);
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let testSession = await sessionManager.createSession("8.8.8.8", { addr: "0x0000000000000000000000000000000000001337" });
+    expect(testSession).to.not.equal(null, "createSession failed");
+    expect(testSession.getSessionStatus()).to.equal(FaucetSessionStatus.FAILED, "unexpected session status");
+    expect(testSession.getSessionData("failed.code")).to.equal("AMOUNT_TOO_LOW", "unexpected error code");
+  });
+
+  it("Restore valid session", async () => {
+    faucetConfig.sessionTimeout = 10;
+    faucetConfig.minDropAmount = 1000;
+    let now = Math.floor(new Date().getTime() / 1000);
+    await ServiceManager.GetService(FaucetDatabase).updateSession({
+      sessionId: "4e63566e-e482-46f3-bb91-da11f511aae5",
+      status: FaucetSessionStatus.RUNNING,
+      startTime: now,
+      targetAddr: "0x0000000000000000000000000000000000001337",
+      dropAmount: "1337",
+      remoteIP: "8.8.8.8",
+      tasks: [],
+      data: {"test.info": "test1"},
+      claim: null,
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    await sessionManager.initialize();
+    let testSession = sessionManager.getSession("4e63566e-e482-46f3-bb91-da11f511aae5", [FaucetSessionStatus.RUNNING]);
+    expect(testSession).to.not.equal(undefined, "getSession failed");
+    await testSession.tryProceedSession();
+    expect(testSession.getRemoteIP()).to.equal("8.8.8.8", "unexpected remoteIP");
+    expect(testSession.getTargetAddr()).to.equal("0x0000000000000000000000000000000000001337", "unexpected targetAddr");
+    expect(Math.abs(testSession.getStartTime() - now)).to.be.lessThan(2, "unexpected startTime");
+    expect(testSession.getBlockingTasks().length).to.equal(0, "unexpected blockingTasks");
+    expect(testSession.getSessionStatus()).to.equal("claimable", "unexpected session status");
+    expect(testSession.getDropAmount()).to.equal(1337n, "unexpected drop amount");
+    testSession.setSessionModuleRef("test.info", "info1234");
+    expect(testSession.getSessionModuleRef("test.info")).to.equal("info1234", "unexpected getSessionModuleRef result");
+  });
+
+  it("Restore invalid session (timed out)", async () => {
+    faucetConfig.sessionTimeout = 10;
+    faucetConfig.minDropAmount = 1000;
+    let now = Math.floor(new Date().getTime() / 1000);
+    await ServiceManager.GetService(FaucetDatabase).updateSession({
+      sessionId: "4e63566e-e482-46f3-bb91-da11f511aae6",
+      status: FaucetSessionStatus.RUNNING,
+      startTime: now - 60,
+      targetAddr: "0x0000000000000000000000000000000000001337",
+      dropAmount: "1337",
+      remoteIP: "8.8.8.8",
+      tasks: [],
+      data: {},
+      claim: null,
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    await sessionManager.initialize();
+    let testSession = sessionManager.getSession("4e63566e-e482-46f3-bb91-da11f511aae6", [FaucetSessionStatus.RUNNING]);
+    expect(testSession).to.not.equal(undefined, "getSession failed");
+    await testSession.tryProceedSession();
+    let sessionData = await sessionManager.getSessionData("4e63566e-e482-46f3-bb91-da11f511aae6");
+    expect(sessionData).to.not.equal(null, "getSessionData failed");
+    expect(sessionData.status).to.equal(FaucetSessionStatus.FAILED, "unexpected session status");
+    expect(sessionData.data["failed.code"]).to.equal("SESSION_TIMEOUT", "unexpected error code");
+  });
+
+  it("Check session task handling ", async () => {
+    faucetConfig.minDropAmount = 1000;
+    let changeAddrCalled = 0;
+    ServiceManager.GetService(ModuleManager).addActionHook(null, ModuleHookAction.SessionStart, 100, "test-task", (session: FaucetSession, userInput: any) => {
+      session.addBlockingTask("test", "test1", 1);
+      session.addBlockingTask("test", "test2", 10);
+    });
+    ServiceManager.GetService(ModuleManager).addActionHook(null, ModuleHookAction.SessionIpChange, 100, "test-task", (session: FaucetSession) => {
+      changeAddrCalled++;
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let testSession = await sessionManager.createSession("8.8.8.8", { addr: "0x0000000000000000000000000000000000001337" });
+    expect(testSession).to.not.equal(null, "createSession failed");
+    expect(testSession.getBlockingTasks().length).to.equal(2, "unexpected blockingTasks");
+    expect(testSession.getSessionStatus()).to.equal(FaucetSessionStatus.RUNNING, "unexpected session status");
+    let error: FaucetError | null = null;
+    try {
+      testSession.setTargetAddr("0x0000000000000000000000000000000000001338");
+    } catch(ex) {
+      error = ex;
+    }
+    expect(error && error instanceof FaucetError).to.equal(true, "unexpected error type");
+    expect(error?.getCode()).to.equal("INVALID_STATE", "unexpected error code");
+    await testSession.updateRemoteIP("::ffff:8.8.8.8");
+    expect(changeAddrCalled).to.equal(0, "SessionIpChange for non-changed ip");
+    await testSession.updateRemoteIP("8.8.4.4");
+    expect(changeAddrCalled).to.equal(1, "no SessionIpChange for changed ip");
+    expect(testSession.getRemoteIP()).to.equal("8.8.4.4", "unexpected remoteIP");
+    testSession.setDropAmount(0n);
+    expect(testSession.getDropAmount()).to.equal(0n, "unexpected drop amount");
+    await testSession.addReward(1000n);
+    testSession.resolveBlockingTask("test", "test1");
+    expect(testSession.getBlockingTasks().length).to.equal(1, "unexpected blockingTasks count after resolving first task");
+    testSession.resolveBlockingTask("test", "test2");
+    expect(testSession.getBlockingTasks().length).to.equal(0, "unexpected blockingTasks count after resolving second task");
+    await awaitSleepPromise(4000, () => testSession.getSessionStatus() === FaucetSessionStatus.CLAIMABLE);
+    expect(testSession.getSessionStatus()).to.equal(FaucetSessionStatus.CLAIMABLE, "unexpected session status");
+  }).timeout(5000);
+
+  it("Check invalid session property changes", async () => {
+    faucetConfig.minDropAmount = 1000;
+    ServiceManager.GetService(ModuleManager).addActionHook(null, ModuleHookAction.SessionStart, 100, "test-task", (session: FaucetSession, userInput: any) => {
+      session.addBlockingTask("test", "test1", 1);
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let testSession = await sessionManager.createSession("::ffff:8.8.8.8", { addr: "0x0000000000000000000000000000000000001337" });
+    expect(testSession).to.not.equal(null, "createSession failed");
+    expect(testSession.getRemoteIP()).to.equal("8.8.8.8", "unexpected remoteIP");
+    await testSession.subPenalty(1000n);
+    expect(testSession.getDropAmount()).to.equal(0n, "unexpected drop amount after subPenalty from initial balance");
+    await testSession.addReward(50n);
+    testSession.resolveBlockingTask("test", "test1");
+    await testSession.tryProceedSession(); // should fail with 0 balance
+    expect(testSession.getSessionStatus()).to.equal(FaucetSessionStatus.FAILED, "unexpected session status");
+    await testSession.setDropAmount(1000n);
+    expect(testSession.getDropAmount()).to.equal(50n, "unexpected drop amount after setDropAmount on failed session");
+    await testSession.addReward(1000n);
+    expect(testSession.getDropAmount()).to.equal(50n, "unexpected drop amount after addReward on failed session");
+    await testSession.subPenalty(1000n);
+    expect(testSession.getDropAmount()).to.equal(50n, "unexpected drop amount after subPenalty on failed session");
+    let sessionInfo = await testSession.getSessionInfo();
+    expect(sessionInfo.session).to.equal(testSession.getSessionId(), "invalid sessioninfo: id mismatch");
+    expect(sessionInfo.balance).to.equal(testSession.getDropAmount().toString(), "invalid sessioninfo: balance mismatch");
+    expect(sessionInfo.failedCode).to.equal("AMOUNT_TOO_LOW", "invalid sessioninfo: failedCode mismatch");
+  });
+
+  it("Check invalid balance change on failed session", async () => {
+    faucetConfig.minDropAmount = 1000;
+    ServiceManager.GetService(ModuleManager).addActionHook(null, ModuleHookAction.SessionStart, 100, "test-task", (session: FaucetSession, userInput: any) => {
+      session.addBlockingTask("test", "test1", 1);
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let testSession = await sessionManager.createSession("::ffff:8.8.8.8", { addr: "0x0000000000000000000000000000000000001337" });
+    expect(testSession).to.not.equal(null, "createSession failed");
+    expect(testSession.getRemoteIP()).to.equal("8.8.8.8", "unexpected remoteIP");
+    await testSession.setSessionFailed("TEST_ERROR", "test");
+    testSession.setDropAmount(1000n);
+    expect(testSession.getDropAmount()).to.equal(0n, "unexpected drop amount after setDropAmount on failed session");
+  });
+
+  it("Check SessionManager: get session data", async () => {
+    faucetConfig.minDropAmount = 1000;
+    ServiceManager.GetService(ModuleManager).addActionHook(null, ModuleHookAction.SessionStart, 100, "test-task", (session: FaucetSession, userInput: any) => {
+      session.addBlockingTask("test", "test1", 1);
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let testSession = await sessionManager.createSession("::ffff:8.8.8.8", { addr: "0x0000000000000000000000000000000000001337" });
+    expect(testSession).to.not.equal(null, "createSession failed");
+    expect(sessionManager.getSession(testSession.getSessionId(), [FaucetSessionStatus.UNKNOWN])).to.equal(null, "unexpected getSession result for non-matching state");
+    expect(sessionManager.getSession("4e63566e-e482-46f3-bb91-da11f511aae0", [FaucetSessionStatus.UNKNOWN])).to.equal(undefined, "unexpected getSession result for unknown session");
+    expect(await sessionManager.getSessionData(testSession.getSessionId())).to.not.equal(null, "unexpected getSessionData result for known session");
+    expect(await sessionManager.getSessionData("4e63566e-e482-46f3-bb91-da11f511aae0")).to.equal(null, "unexpected getSessionData result for unknown session");
+    expect(sessionManager.getActiveSessions().length).to.equal(1, "unexpected getActiveSessions result count");
+  });
+
+  it("reports a session as failed while its row is still being written", async () => {
+    faucetConfig.minDropAmount = 1000;
+    ServiceManager.GetService(ModuleManager).addActionHook(null, ModuleHookAction.SessionStart, 100, "test-task", (session: FaucetSession, userInput: any) => {
+      session.addBlockingTask("test", "test1", 1);
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let testSession = await sessionManager.createSession("::ffff:8.8.8.8", { addr: "0x0000000000000000000000000000000000001337" });
+    expect(testSession).to.not.equal(null, "createSession failed");
+
+    // a slow database: the failure takes a while to reach the row, and the status is asked for in the meantime
+    let faucetDb = ServiceManager.GetService(FaucetDatabase);
+    let updateSession = faucetDb.updateSession.bind(faucetDb);
+    let updateStub = sinon.stub(faucetDb, "updateSession").callsFake(async (sessionData) => {
+      await awaitSleepPromise(200, () => false);
+      return updateSession(sessionData);
+    });
+    let failPromise = testSession.setSessionFailed("TEST_KILL", "killed by the test");
+    let statusData = await sessionManager.getSessionData(testSession.getSessionId());
+    expect(statusData.status).to.equal(FaucetSessionStatus.FAILED, "the status answered while the row was being written");
+    expect(statusData.data["failed.code"]).to.equal("TEST_KILL", "the failure code answered while the row was being written");
+    await failPromise;
+    updateStub.restore();
+
+    expect(sessionManager.getActiveSessions().length).to.equal(0, "the failed session is still listed as active");
+    expect(sessionManager.getSession(testSession.getSessionId())).to.equal(undefined, "the failed session is still held by the manager");
+    expect((await faucetDb.getSession(testSession.getSessionId())).status).to.equal(FaucetSessionStatus.FAILED, "the row does not carry the failure");
+  });
+
+  it("Check SessionManager: getUnclaimedBalance", async () => {
+    faucetConfig.minDropAmount = 1000;
+    ServiceManager.GetService(ModuleManager).addActionHook(null, ModuleHookAction.SessionStart, 100, "test-task", (session: FaucetSession, userInput: any) => {
+      session.addBlockingTask("test", "test1", 1);
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    let testSession = await sessionManager.createSession("::ffff:8.8.8.8", { addr: "0x0000000000000000000000000000000000001337" });
+    await testSession.addReward(1000n);
+    expect(await sessionManager.getUnclaimedBalance()).to.equal(1000n, "unexpected getUnclaimedBalance result");
+  });
+
+  it("Check SessionManager: session timeout processing", async () => {
+    faucetConfig.sessionTimeout = 10;
+    faucetConfig.minDropAmount = 1000;
+    let now = Math.floor(new Date().getTime() / 1000);
+    await ServiceManager.GetService(FaucetDatabase).updateSession({
+      sessionId: "4e63566e-e482-46f3-bb91-da11f511ab01",
+      status: FaucetSessionStatus.RUNNING,
+      startTime: now - 60,
+      targetAddr: "0x0000000000000000000000000000000000001337",
+      dropAmount: "1337",
+      remoteIP: "8.8.8.8",
+      tasks: [],
+      data: {},
+      claim: null,
+    });
+    let sessionManager = ServiceManager.GetService(SessionManager);
+    await sessionManager.initialize();
+    await ServiceManager.GetService(FaucetDatabase).updateSession({
+      sessionId: "4e63566e-e482-46f3-bb91-da11f511ab02",
+      status: FaucetSessionStatus.RUNNING,
+      startTime: now - 60,
+      targetAddr: "0x0000000000000000000000000000000000001337",
+      dropAmount: "1337",
+      remoteIP: "8.8.8.8",
+      tasks: [],
+      data: {},
+      claim: null,
+    });
+    await sessionManager.processSessionTimeouts();
+    await sessionManager.saveAllSessions();
+    let session1 = await sessionManager.getSessionData("4e63566e-e482-46f3-bb91-da11f511ab01");
+    expect(session1).to.not.equal(null, "getSessionData failed");
+    expect(session1.status).to.equal(FaucetSessionStatus.FAILED, "unexpected session status");
+    expect(session1.data["failed.code"]).to.equal("SESSION_TIMEOUT", "unexpected error code");
+    let session2 = await sessionManager.getSessionData("4e63566e-e482-46f3-bb91-da11f511ab02");
+    expect(session2).to.not.equal(null, "getSessionData failed");
+    expect(session2.status).to.equal(FaucetSessionStatus.FAILED, "unexpected session status");
+    expect(session2.data["failed.code"]).to.equal("SESSION_TIMEOUT", "unexpected error code");
+    let testSession = await sessionManager.createSession("::ffff:8.8.8.8", { addr: "0x0000000000000000000000000000000000001337" });
+    await sessionManager.processSessionTimeouts();
+    expect(testSession.getSessionStatus()).to.equal(FaucetSessionStatus.CLAIMABLE, "unexpected session status");
+  });
+});

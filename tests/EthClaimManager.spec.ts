@@ -1,0 +1,846 @@
+import 'mocha';
+import sinon from 'sinon';
+import { expect } from 'chai';
+import { bindTestStubs, unbindTestStubs, loadDefaultTestConfig, awaitSleepPromise, createFuse, fusedSleep } from './common.js';
+import { ServiceManager } from '../src/common/ServiceManager.js';
+import { FaucetDatabase } from '../src/db/FaucetDatabase.js';
+import { ModuleHookAction, ModuleManager } from '../src/modules/ModuleManager.js';
+import { SessionManager } from '../src/session/SessionManager.js';
+import { faucetConfig } from '../src/config/FaucetConfig.js';
+import { FaucetError } from '../src/common/FaucetError.js';
+import { FaucetSession, FaucetSessionStatus, FaucetSessionStoreData } from '../src/session/FaucetSession.js';
+import { BatchTooExpensiveError } from '../src/eth/claimtx/ClaimTxBuilder.js';
+import { ClaimTxStatus, EthClaimInfo, EthClaimManager } from '../src/eth/EthClaimManager.js';
+import { getNewGuid } from '../src/utils/GuidUtils.js';
+import { EthWalletManager, TransactionResult } from '../src/eth/EthWalletManager.js';
+import { sleepPromise } from '../src/utils/PromiseUtils.js';
+import { FakeWebSocket, injectFakeWebSocket } from './stubs/FakeWebSocket.js';
+import { EthClaimNotificationClient } from '../src/eth/EthClaimNotificationClient.js';
+
+
+describe("ETH Claim Manager", () => {
+  let globalStubs;
+
+  beforeEach(async () => {
+    globalStubs = bindTestStubs({
+      "EthWalletManager.sendClaimTx": sinon.stub(EthWalletManager.prototype, "sendClaimTx"),
+    });
+    loadDefaultTestConfig();
+    await ServiceManager.GetService(FaucetDatabase).initialize();
+    await ServiceManager.GetService(ModuleManager).initialize();
+    faucetConfig.minDropAmount = 10;
+    faucetConfig.maxDropAmount = 1000;
+  });
+  afterEach(async () => {
+    let dbService = ServiceManager.GetService(FaucetDatabase);
+    await ServiceManager.DisposeAllServices();
+    await dbService.closeDatabase();
+    await unbindTestStubs(globalStubs);
+  });
+
+  async function addTestSession(status: FaucetSessionStatus, claimData: any, amount?: string): Promise<FaucetSessionStoreData> {
+    let sessionData: FaucetSessionStoreData = {
+      sessionId: getNewGuid(),
+      startTime: Math.floor(new Date().getTime() / 1000),
+      status: status,
+      dropAmount: amount || "100",
+      remoteIP: "8.8.8.8",
+      targetAddr: "0x0000000000000000000000000000000000001337",
+      tasks: [],
+      data: {},
+      claim: claimData,
+    }
+    await ServiceManager.GetService(FaucetDatabase).updateSession(sessionData);
+    return sessionData;
+  }
+
+  function getTestReceipt(): any {
+    return {
+      status: true,
+      transactionHash: null,
+      transactionIndex: 1,
+      blockHash: "0xfce202c4104864d81d8bd78b7202a77e5dca634914a3fd6636f2765d65fa9a07",
+      blockNumber: 0x8aa5ae,
+      from: "0x0000000000000000000000000000000000004242",
+      to: "0x0000000000000000000000000000000000001337",
+      contractAddress: null,
+      cumulativeGasUsed: 0x1752665,
+      gasUsed: 10,
+      effectiveGasPrice: 10,
+      logs: [],
+      logsBloom: "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    };
+  }
+
+  it("Load stored claim queue", async () => {
+    await addTestSession(FaucetSessionStatus.CLAIMING, {
+      claimIdx: 5,
+      claimStatus: ClaimTxStatus.QUEUE,
+      claimTime: Math.floor(new Date().getTime() / 1000),
+    });
+    await addTestSession(FaucetSessionStatus.CLAIMING, {
+      claimIdx: 3,
+      claimStatus: "unknown",
+      claimTime: Math.floor(new Date().getTime() / 1000),
+      txHash: "0xdb5950d44ceed2a5eb77970104b974b8c4234d7110fd8d0008edb2cfff835f04"
+    });
+    await addTestSession(FaucetSessionStatus.CLAIMING, {
+      claimIdx: 2,
+      claimStatus: ClaimTxStatus.PENDING,
+      claimTime: Math.floor(new Date().getTime() / 1000),
+      txHash: "0x7c4074c4d182e312adf698795835cbd2d597246cdd47013f09c7bb81f33a363c"
+    });
+    let ses4 = await addTestSession(FaucetSessionStatus.CLAIMING, {
+      claimIdx: 2,
+      claimStatus: ClaimTxStatus.QUEUE,
+      claimTime: Math.floor(new Date().getTime() / 1000),
+    });
+
+    globalStubs["watchClaimTx"] = sinon.stub(EthWalletManager.prototype, "watchClaimTx").returns(new Promise(() => {}));
+
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+
+    expect(claimManager.getQueuedAmount()).to.equal(200n, "unexpected queued balance");
+    let txQueue = claimManager.getTransactionQueue(true);
+    expect(txQueue.length).to.equal(2, "unexpected queue length");
+    expect(txQueue[0].session).to.equal(ses4.sessionId, "unexpected queue order");
+  });
+
+  it("Check restored pending claim processing", async () => {
+    let ses1 = await addTestSession(FaucetSessionStatus.CLAIMING, {
+      claimIdx: 2,
+      claimStatus: ClaimTxStatus.PENDING,
+      claimTime: Math.floor(new Date().getTime() / 1000),
+      txHash: "0x7c4074c4d182e312adf698795835cbd2d597246cdd47013f09c7bb81f33a3601"
+    });
+    let ses2 = await addTestSession(FaucetSessionStatus.CLAIMING, {
+      claimIdx: 2,
+      claimStatus: ClaimTxStatus.PENDING,
+      claimTime: Math.floor(new Date().getTime() / 1000),
+      txHash: "0x7c4074c4d182e312adf698795835cbd2d597246cdd47013f09c7bb81f33a3602"
+    });
+    let ses3 = await addTestSession(FaucetSessionStatus.CLAIMING, {
+      claimIdx: 2,
+      claimStatus: ClaimTxStatus.PENDING,
+      claimTime: Math.floor(new Date().getTime() / 1000),
+      txHash: "0x7c4074c4d182e312adf698795835cbd2d597246cdd47013f09c7bb81f33a3603"
+    });
+
+    let txResFuse: any = {};
+    let txResults: {[sesId: string]: Promise<{
+      status: boolean;
+      block: number;
+      fee: bigint;
+      receipt: any;
+    }>} = {
+      [ses1.sessionId]: awaitSleepPromise(200, () => txResFuse.ses1).then(() => ({
+        status: true,
+        block: 1,
+        fee: 100n,
+        receipt: Object.assign(getTestReceipt()),
+      })),
+      [ses2.sessionId]: awaitSleepPromise(200, () => txResFuse.ses2).then(() => ({
+        status: true,
+        block: 1,
+        fee: 100n,
+        receipt: Object.assign(getTestReceipt()),
+      })),
+      [ses3.sessionId]: awaitSleepPromise(200, () => txResFuse.ses3).then(() => {
+        throw "test error";
+      }),
+    };
+    globalStubs["watchClaimTx"] = sinon.stub(EthWalletManager.prototype, "watchClaimTx").callsFake((claimTx) => txResults[claimTx.session]);
+
+    let claimed: {[s: string]: EthClaimInfo} = {};
+    ServiceManager.GetService(ModuleManager).addActionHook(null, ModuleHookAction.SessionClaimed, 100, "test-task", (claimInfo: EthClaimInfo) => {
+      claimed[claimInfo.session] = claimInfo;
+    });
+
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+
+    txResFuse.ses1 = true;
+    await awaitSleepPromise(500, () => !!claimed[ses1.sessionId]);
+    expect(claimed[ses1.sessionId]?.claim.claimStatus).to.equal(ClaimTxStatus.CONFIRMED, "unexpected ses1 claim status");
+
+    txResFuse.ses2 = true;
+    await awaitSleepPromise(500, () => !!claimed[ses2.sessionId]);
+    expect(claimed[ses2.sessionId]?.claim.claimStatus).to.equal(ClaimTxStatus.CONFIRMED, "unexpected ses2 claim status");
+
+    txResFuse.ses3 = true;
+    let claim3 = claimManager.getTransactionQueue().filter(t => t.session === ses3.sessionId)[0];
+    await awaitSleepPromise(500, () => claim3?.claim.claimStatus === ClaimTxStatus.FAILED);
+    expect(claim3?.claim.claimStatus).to.equal(ClaimTxStatus.FAILED, "unexpected ses3 claim status");
+  });
+
+  it("Create session claim, Invalid: session not claimable", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession = await addTestSession(FaucetSessionStatus.FAILED, null);
+
+    let error: FaucetError | null = null;
+    try {
+      await claimManager.createSessionClaim(testSession, {});
+    } catch(ex) {
+      error = ex;
+    }
+    expect(error).to.not.equal(null, "no exception thrown");
+    expect(error instanceof FaucetError).to.equal(true, "unexpected error type");
+    expect(error?.getCode()).to.equal("NOT_CLAIMABLE", "unexpected error code");
+    expect(claimManager.getTransactionQueue().length).to.equal(0, "unexpected queue count");
+  });
+
+  it("Create session claim, Invalid: already claiming", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    ServiceManager.GetService(ModuleManager).addActionHook(null, ModuleHookAction.SessionClaim, 100, "test-task", (claimInfo: EthClaimInfo) => {
+      return sleepPromise(50);
+    });
+    let testSession = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+    claimManager.createSessionClaim(testSession, {});
+
+    let error: FaucetError | null = null;
+    try {
+      await claimManager.createSessionClaim(testSession, {});
+    } catch(ex) {
+      error = ex;
+    }
+    expect(error).to.not.equal(null, "no exception thrown");
+    expect(error instanceof FaucetError).to.equal(true, "unexpected error type");
+    expect(error?.getCode()).to.equal("RACE_CLAIMING", "unexpected error code");
+    expect(claimManager.getTransactionQueue().length).to.equal(1, "unexpected queue count");
+  });
+
+  it("Create session claim, Invalid: amount too low", async () => {
+    faucetConfig.minDropAmount = 200;
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+
+    let error: FaucetError | null = null;
+    try {
+      await claimManager.createSessionClaim(testSession, {});
+    } catch(ex) {
+      error = ex;
+    }
+    expect(error).to.not.equal(null, "no exception thrown");
+    expect(error instanceof FaucetError).to.equal(true, "unexpected error type");
+    expect(error?.getCode()).to.equal("AMOUNT_TOO_LOW", "unexpected error code");
+    expect(claimManager.getTransactionQueue().length).to.equal(0, "unexpected queue count");
+  });
+
+  it("Create session claim: Trim too high amount", async () => {
+    faucetConfig.maxDropAmount = 50;
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+
+    let claim = await claimManager.createSessionClaim(testSession, {});
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.QUEUE, "unexpected claim status");
+    expect(claim.amount).to.equal("50", "unexpected claim amount");
+    expect(claimManager.getTransactionQueue().length).to.equal(1, "unexpected queue count");
+
+    let sessionData = await ServiceManager.GetService(SessionManager).getSessionData(testSession.sessionId);
+    expect(sessionData.status).to.equal(FaucetSessionStatus.CLAIMING, "unexpected session status");
+    expect(sessionData.dropAmount).to.equal("50", "unexpected session drop amount");
+  });
+
+  it("Queue processing: Check processing if wallet not ready (skip)", async () => {
+    faucetConfig.ethQueueNoFunds = true;
+    
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+
+    let claim = await claimManager.createSessionClaim(testSession, {});
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.QUEUE, "unexpected claim status before processQueue");
+    
+    globalStubs["getWalletState"] = sinon.stub(EthWalletManager.prototype, "getWalletState").returns({
+      ready: false,
+      nonce: 0,
+      balance: 0n,
+      nativeBalance: 0n,
+    });
+    await claimManager.processQueue();
+
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.QUEUE, "unexpected claim status after processQueue");
+  });
+
+  it("Queue processing: Check processing if wallet not ready (fail)", async () => {
+    faucetConfig.ethQueueNoFunds = false;
+
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+
+    let claim = await claimManager.createSessionClaim(testSession, {});
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.QUEUE, "unexpected claim status before processQueue");
+    
+    globalStubs["getWalletState"] = sinon.stub(EthWalletManager.prototype, "getWalletState").returns({
+      ready: false,
+      nonce: 0,
+      balance: 0n,
+      nativeBalance: 0n,
+    });
+    await claimManager.processQueue();
+
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.FAILED, "unexpected claim status after processQueue");
+    expect(claim.claim.txError).to.matches(/RPC is currently unreachable/, "unexpected claim error message");
+  });
+
+  it("Queue processing: Check processing if wallet is out of funds (fail)", async () => {
+    faucetConfig.ethQueueNoFunds = false;
+
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+
+    let claim = await claimManager.createSessionClaim(testSession, {});
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.QUEUE, "unexpected claim status before processQueue");
+    
+    globalStubs["getWalletState"] = sinon.stub(EthWalletManager.prototype, "getWalletState").returns({
+      ready: true,
+      nonce: 0,
+      balance: 10n,
+      nativeBalance: 10n,
+    });
+    await claimManager.processQueue();
+
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.FAILED, "unexpected claim status after processQueue");
+    expect(claim.claim.txError).to.matches(/wallet is out of funds/, "unexpected claim error message");
+  });
+
+  it("Queue processing: Check processing if transaction fails unexpectedly (fail)", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+
+    let claim = await claimManager.createSessionClaim(testSession, {});
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.QUEUE, "unexpected claim status before processQueue");
+    
+    globalStubs["getWalletState"] = sinon.stub(EthWalletManager.prototype, "getWalletState").returns({
+      ready: true,
+      nonce: 0,
+      balance: 1000000000000000000n,
+      nativeBalance: 1000000000000000000n,
+    });
+    globalStubs["EthWalletManager.sendClaimTx"].returns(Promise.reject("test error"));
+
+    await claimManager.processQueue();
+
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.FAILED, "unexpected claim status after processQueue");
+    expect(claim.claim.txError).to.matches(/test error/, "unexpected claim error message");
+  });
+
+  it("Queue processing: Check processing if transaction creation fails unexpectedly", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+
+    let claim = await claimManager.createSessionClaim(testSession, {});
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.QUEUE, "unexpected claim status before processQueue");
+    
+    globalStubs["getWalletState"] = sinon.stub(EthWalletManager.prototype, "getWalletState").returns({
+      ready: true,
+      nonce: 0,
+      balance: 1000000000000000000n,
+      nativeBalance: 1000000000000000000n,
+    });
+    let claimFuse = createFuse();
+    globalStubs["EthWalletManager.sendClaimTx"].returns(fusedSleep(claimFuse, 500).then(() => {
+      throw "test error";
+    }));
+
+    let processPromise = claimManager.processQueue();
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.PROCESSING, "unexpected claim status during processQueue");
+
+    claimFuse();
+    await processPromise;
+
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.FAILED, "unexpected claim status after processQueue");
+    expect(claim.claim.txError).to.matches(/test error/, "unexpected claim error message");
+  });
+
+  it("Queue processing: Check processing if transaction processing fails unexpectedly", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+
+    let claim = await claimManager.createSessionClaim(testSession, {});
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.QUEUE, "unexpected claim status before processQueue");
+    
+    globalStubs["getWalletState"] = sinon.stub(EthWalletManager.prototype, "getWalletState").returns({
+      ready: true,
+      nonce: 0,
+      balance: 1000000000000000000n,
+      nativeBalance: 1000000000000000000n,
+    });
+    let claimFuse = createFuse();
+    globalStubs["EthWalletManager.sendClaimTx"].returns(Promise.resolve({
+      txHash: "0xdb5950d44ceed2a5eb77970104b974b8c4234d7110fd8d0008edb2cfff835f01",
+      txPromise: fusedSleep(claimFuse, 500).then(() => {
+        throw "test error";
+      }),
+    } as TransactionResult));
+
+    await claimManager.processQueue();
+
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.PENDING, "unexpected claim status after processQueue");
+
+    claimFuse();
+    await awaitSleepPromise(100, () => claim.claim.claimStatus === ClaimTxStatus.FAILED);
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.FAILED, "unexpected claim status after tx failure");
+    expect(claim.claim.txError).to.matches(/test error/, "unexpected claim error message");
+  });
+
+  it("Queue processing: Check processing for successful transaction", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+
+    let claim = await claimManager.createSessionClaim(testSession, {});
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.QUEUE, "unexpected claim status before processQueue");
+    
+    globalStubs["getWalletState"] = sinon.stub(EthWalletManager.prototype, "getWalletState").returns({
+      ready: true,
+      nonce: 0,
+      balance: 1000000000000000000n,
+      nativeBalance: 1000000000000000000n,
+    });
+    let claimFuse = createFuse();
+    globalStubs["EthWalletManager.sendClaimTx"].returns(Promise.resolve({
+      txHash: "0xdb5950d44ceed2a5eb77970104b974b8c4234d7110fd8d0008edb2cfff835f01",
+      txPromise: fusedSleep(claimFuse, 500).then(() => ({
+        status: true,
+        block: 1,
+        fee: 100n,
+        receipt: getTestReceipt(),
+      })),
+    } as TransactionResult));
+
+    await claimManager.processQueue();
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.PENDING, "unexpected claim status after processQueue");
+
+    claimFuse();
+    await awaitSleepPromise(1000, () => claim.claim.claimStatus === ClaimTxStatus.CONFIRMED);
+
+    expect(claim.claim.claimStatus).to.equal(ClaimTxStatus.CONFIRMED, "unexpected claim status after tx confirmation");
+  });
+
+  it("Notification Websocket: Check initialization (invalid url)", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+
+    let fakeWs1 = await injectFakeWebSocket("/ws/claim?session=session=[]12&&session=false", "8.8.8.8");
+    let errorMsg = fakeWs1.getSentMessage("error");
+    expect(errorMsg.length).to.equal(1, "no error message returned");
+    expect(errorMsg[0].data.reason).to.matches(/session not found/, "unexpected error message returned");
+  });
+
+  it("Notification Websocket: Check initialization (missing session id)", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+
+    let fakeWs1 = await injectFakeWebSocket("/ws/claim", "8.8.8.8");
+    let errorMsg = fakeWs1.getSentMessage("error");
+    expect(errorMsg.length).to.equal(1, "no error message returned");
+    expect(errorMsg[0].data.reason).to.matches(/session not found/, "unexpected error message returned");
+  });
+
+  it("Notification Websocket: Check claim notifications", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession1 = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+    let claim1 = await claimManager.createSessionClaim(testSession1, {});
+    let testSession2 = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+    let claim2 = await claimManager.createSessionClaim(testSession2, {});
+    
+    globalStubs["getWalletState"] = sinon.stub(EthWalletManager.prototype, "getWalletState").returns({
+      ready: true,
+      nonce: 0,
+      balance: 1000000000000000000n,
+      nativeBalance: 1000000000000000000n,
+    });
+    let claimFuses: (() => void)[] = [];
+    globalStubs["EthWalletManager.sendClaimTx"].callsFake(() => {
+      let claimFuse = createFuse();
+      claimFuses.push(claimFuse);
+      return Promise.resolve({
+        txHash: "0xdb5950d44ceed2a5eb77970104b974b8c4234d7110fd8d0008edb2cfff835f01",
+        txPromise: fusedSleep(claimFuse, 500).then(() => ({
+          status: true,
+          block: 1,
+          fee: 100n,
+          receipt: getTestReceipt(),
+        })),
+      } as TransactionResult);
+    });
+
+    let fakeWs2 = await injectFakeWebSocket("/ws/claim?session=" + testSession2.sessionId, "8.8.8.8");
+    expect(fakeWs2.isReady).to.equal(true, "websocket2 was closed");
+
+    await claimManager.processQueue();
+    expect(claim1.claim.claimStatus).to.equal(ClaimTxStatus.PENDING, "unexpected claim1 status after processQueue");
+    expect(claim2.claim.claimStatus).to.equal(ClaimTxStatus.PENDING, "unexpected claim2 status after processQueue");
+
+    let fakeWs1 = await injectFakeWebSocket("/ws/claim?session=" + testSession1.sessionId, "8.8.8.8");
+    expect(fakeWs1.isReady).to.equal(true, "websocket1 was closed");
+    await awaitSleepPromise(100, () => fakeWs1.getSentMessage("update").length > 1);
+    let updateMsg = fakeWs1.getSentMessage("update");
+    expect(updateMsg.length).to.equal(1, "no update message sent");
+    expect(updateMsg[updateMsg.length - 1].data.processedIdx).to.equal(2, "unexpected processed count in last update");
+
+    updateMsg = fakeWs2.getSentMessage("update");
+    expect(updateMsg.length).to.equal(1, "no update message sent");
+    expect(updateMsg[updateMsg.length - 1].data.processedIdx).to.equal(2, "unexpected processed count in last update");
+
+    claimFuses[0]();
+    await awaitSleepPromise(100, () => claim1.claim.claimStatus === ClaimTxStatus.CONFIRMED);
+    await claimManager.processQueue();
+    await awaitSleepPromise(100, () => fakeWs2.getSentMessage("update").length > 2);
+
+    updateMsg = fakeWs2.getSentMessage("update");
+    expect(updateMsg.length).to.equal(2, "no update message sent on 1st confirmation");
+    expect(updateMsg[updateMsg.length - 1].data.processedIdx).to.equal(2, "unexpected processed count in last update");
+    expect(updateMsg[updateMsg.length - 1].data.confirmedIdx).to.equal(1, "unexpected confirmed count in last update");
+
+    claimFuses[1]();
+    await awaitSleepPromise(100, () => claim2.claim.claimStatus === ClaimTxStatus.CONFIRMED);
+    await claimManager.processQueue();
+    await awaitSleepPromise(100, () => fakeWs2.getSentMessage("update").length > 3);
+
+    updateMsg = fakeWs2.getSentMessage("update");
+    expect(updateMsg.length).to.equal(3, "no update message sent on 2nd confirmation");
+    expect(updateMsg[updateMsg.length - 1].data.processedIdx).to.equal(2, "unexpected processed count in last update");
+    expect(updateMsg[updateMsg.length - 1].data.confirmedIdx).to.equal(2, "unexpected confirmed count in last update");
+
+    let errorMsg = fakeWs2.getSentMessage("error");
+    expect(errorMsg.length).to.equal(1, "no error message sent after confirmation");
+  });
+
+  it("Notification Websocket: a later claim's receipt does not settle an earlier pending claim", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession1 = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+    let claim1 = await claimManager.createSessionClaim(testSession1, {});
+    let testSession2 = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+    let claim2 = await claimManager.createSessionClaim(testSession2, {});
+
+    globalStubs["getWalletState"] = sinon.stub(EthWalletManager.prototype, "getWalletState").returns({
+      ready: true,
+      nonce: 0,
+      balance: 1000000000000000000n,
+      nativeBalance: 1000000000000000000n,
+    });
+    let claimFuses: (() => void)[] = [];
+    globalStubs["EthWalletManager.sendClaimTx"].callsFake(() => {
+      let claimFuse = createFuse();
+      claimFuses.push(claimFuse);
+      return Promise.resolve({
+        txHash: "0xdb5950d44ceed2a5eb77970104b974b8c4234d7110fd8d0008edb2cfff835f0" + claimFuses.length,
+        txPromise: fusedSleep(claimFuse, 500).then(() => ({
+          status: true,
+          block: 1,
+          fee: 100n,
+          receipt: getTestReceipt(),
+        })),
+      } as TransactionResult);
+    });
+
+    await claimManager.processQueue();
+    expect(claim1.claim.claimStatus).to.equal(ClaimTxStatus.PENDING, "unexpected claim1 status after processQueue");
+    expect(claim2.claim.claimStatus).to.equal(ClaimTxStatus.PENDING, "unexpected claim2 status after processQueue");
+    let fakeWs1 = await injectFakeWebSocket("/ws/claim?session=" + testSession1.sessionId, "8.8.8.8");
+    let fakeWs2 = await injectFakeWebSocket("/ws/claim?session=" + testSession2.sessionId, "8.8.8.8");
+    expect(fakeWs1.getSentMessage("update")[0].data.settled).to.equal(false, "claim1 reported settled while pending");
+    expect(fakeWs2.getSentMessage("update")[0].data.settled).to.equal(false, "claim2 reported settled while pending");
+
+    // the second claim's receipt is observed first
+    claimFuses[1]();
+    await awaitSleepPromise(1000, () => claim2.claim.claimStatus === ClaimTxStatus.CONFIRMED);
+    await claimManager.processQueue();
+
+    let updateMsg = fakeWs2.getSentMessage("update");
+    expect(updateMsg.length).to.equal(2, "no update message sent to claim2 on its confirmation");
+    expect(updateMsg[1].data.settled).to.equal(true, "claim2 not reported settled");
+    expect(updateMsg[1].data.confirmedIdx).to.equal(0, "settled index moved past the pending claim1");
+    expect(fakeWs2.isReady).to.equal(false, "websocket2 still open after its claim settled");
+
+    updateMsg = fakeWs1.getSentMessage("update");
+    expect(updateMsg.length).to.equal(2, "no update message sent to claim1 on claim2's confirmation");
+    expect(updateMsg[1].data.settled).to.equal(false, "claim1 reported settled while its transaction is pending");
+    expect(fakeWs1.isReady).to.equal(true, "websocket1 closed while its claim is pending");
+
+    claimFuses[0]();
+    await awaitSleepPromise(1000, () => claim1.claim.claimStatus === ClaimTxStatus.CONFIRMED);
+    await claimManager.processQueue();
+
+    updateMsg = fakeWs1.getSentMessage("update");
+    expect(updateMsg.length).to.equal(3, "no update message sent to claim1 on its confirmation");
+    expect(updateMsg[2].data.settled).to.equal(true, "claim1 not reported settled");
+    expect(updateMsg[2].data.confirmedIdx).to.equal(2, "unexpected settled index after both confirmations");
+    expect(fakeWs1.isReady).to.equal(false, "websocket1 still open after its claim settled");
+  });
+
+  it("Notification Websocket: a failed claim is settled once its row is written", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+    let claim = await claimManager.createSessionClaim(testSession, {});
+
+    globalStubs["getWalletState"] = sinon.stub(EthWalletManager.prototype, "getWalletState").returns({
+      ready: true,
+      nonce: 0,
+      balance: 1000000000000000000n,
+      nativeBalance: 1000000000000000000n,
+    });
+    let claimFuse = createFuse();
+    globalStubs["EthWalletManager.sendClaimTx"].returns(Promise.resolve({
+      txHash: "0xdb5950d44ceed2a5eb77970104b974b8c4234d7110fd8d0008edb2cfff835f01",
+      txPromise: fusedSleep(claimFuse, 500).then(() => { throw "transaction dropped"; }),
+    } as TransactionResult));
+    // a slow database: the notification has to wait for the row
+    let updateClaimData = FaucetDatabase.prototype.updateClaimData;
+    globalStubs["FaucetDatabase.updateClaimData"] = sinon.stub(FaucetDatabase.prototype, "updateClaimData").callsFake(async function(this: FaucetDatabase, sessionId: string, claimData: any) {
+      await sleepPromise(300);
+      return updateClaimData.call(this, sessionId, claimData);
+    });
+
+    await claimManager.processQueue();
+    let fakeWs = await injectFakeWebSocket("/ws/claim?session=" + testSession.sessionId, "8.8.8.8");
+    expect(fakeWs.getSentMessage("update")[0].data.settled).to.equal(false, "claim reported settled while pending");
+
+    claimFuse();
+    await awaitSleepPromise(1000, () => claim.claim.claimStatus === ClaimTxStatus.FAILED);
+    await claimManager.processQueue();
+
+    let updateMsg = fakeWs.getSentMessage("update");
+    expect(updateMsg.length).to.equal(2, "no update message sent on the failure");
+    expect(updateMsg[1].data.settled).to.equal(true, "failed claim not reported settled");
+    expect(updateMsg[1].data.confirmedIdx).to.equal(1, "settled index does not cover the failed claim");
+    expect(fakeWs.isReady).to.equal(false, "websocket still open after the claim failed");
+    let storedSession = await ServiceManager.GetService(FaucetDatabase).getSession(testSession.sessionId);
+    expect(storedSession.status).to.equal(FaucetSessionStatus.FAILED, "session row not final when the settlement was announced");
+  });
+
+  it("Notification Websocket: Check ping timeout handling", async () => {
+    EthClaimNotificationClient.cfgPingInterval = 1;
+    EthClaimNotificationClient.cfgPingTimeout = 2;
+    globalStubs["FakeWebSocket.ping"] = sinon.stub(FakeWebSocket.prototype, "ping");
+    globalStubs["FakeWebSocket.pong"] = sinon.stub(FakeWebSocket.prototype, "pong");
+
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession1 = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+    await claimManager.createSessionClaim(testSession1, {});
+
+    let fakeSocket = await injectFakeWebSocket("/ws/claim?session=" + testSession1.sessionId, "8.8.8.8");
+    expect(fakeSocket.isReady).to.equal(true, "websocket1 was closed");
+
+    fakeSocket.emit("pong");
+    fakeSocket.emit("ping");
+    expect(globalStubs["FakeWebSocket.pong"].called).to.equal(true, "pong not called");
+    expect(globalStubs["FakeWebSocket.ping"].called).to.equal(false, "unexpected ping call");
+    await awaitSleepPromise(1100, () => globalStubs["FakeWebSocket.ping"].called);
+    expect(fakeSocket.isReady).to.equal(true, "client not ready");
+    expect(globalStubs["FakeWebSocket.ping"].called).to.equal(true, "ping not called");
+    expect(fakeSocket.isReady).to.equal(true, "unexpected close call");
+    await awaitSleepPromise(3000, () => !fakeSocket.isReady);
+    expect(fakeSocket.isReady).to.equal(false, "client is still ready");
+  }).timeout(5000);
+
+  it("Notification Websocket: Check client error handling", async () => {
+    let claimManager = ServiceManager.GetService(EthClaimManager);
+    await claimManager.initialize();
+    let testSession1 = await addTestSession(FaucetSessionStatus.CLAIMABLE, null);
+    await claimManager.createSessionClaim(testSession1, {});
+
+    let fakeSocket = await injectFakeWebSocket("/ws/claim?session=" + testSession1.sessionId, "8.8.8.8");
+    expect(fakeSocket.isReady).to.equal(true, "websocket1 was closed");
+
+    fakeSocket.emit("error", "test error");
+    fakeSocket.emit("close");
+    expect(fakeSocket.isReady).to.equal(false, "client still ready");
+  });
+
+  describe("Batched claim transactions", () => {
+    const TX_HASH = "0xdb5950d44ceed2a5eb77970104b974b8c4234d7110fd8d0008edb2cfff835f0a";
+
+    function useBatchTemplate(maxClaims: number, maxWaitSeconds: number) {
+      faucetConfig.ethClaimBatch = { maxClaims, maxWaitSeconds };
+      // the delegation setup is the wallet manager's business (its own spec); here it is in place
+      globalStubs["ensureClaimBatching"] = sinon.stub(EthWalletManager.prototype, "ensureClaimBatching").callsFake(function(this: EthWalletManager) {
+        this.getClaimTxBuilder().setBatchActive(true);
+        return Promise.resolve(true);
+      });
+      globalStubs["getWalletState"] = sinon.stub(EthWalletManager.prototype, "getWalletState").returns({
+        ready: true,
+        nonce: 0,
+        balance: 1000000000000000000n,
+        nativeBalance: 1000000000000000000n,
+      });
+      globalStubs["EthWalletManager.sendClaimBatch"] = sinon.stub(EthWalletManager.prototype, "sendClaimBatch");
+    }
+
+    async function queueClaims(claimManager: EthClaimManager, count: number): Promise<EthClaimInfo[]> {
+      let claims: EthClaimInfo[] = [];
+      for(let i = 0; i < count; i++) {
+        let session = await addTestSession(FaucetSessionStatus.CLAIMABLE, null, (100 * (i + 1)).toString());
+        session.targetAddr = "0x000000000000000000000000000000000000100" + i;
+        claims.push(await claimManager.createSessionClaim(session, {}));
+      }
+      return claims;
+    }
+
+    it("groups queued claims into one transaction up to maxClaims", async () => {
+      let claimManager = ServiceManager.GetService(EthClaimManager);
+      await claimManager.initialize();
+      useBatchTemplate(2, 0);
+      let claims = await queueClaims(claimManager, 3);
+      globalStubs["EthWalletManager.sendClaimBatch"].returns(Promise.resolve({ txHash: TX_HASH, txPromise: new Promise(() => {}), plan: null }));
+      globalStubs["EthWalletManager.sendClaimTx"].returns(Promise.resolve({ txHash: TX_HASH.replace(/a$/, "b"), txPromise: new Promise(() => {}), plan: null }));
+
+      await claimManager.processQueue();
+
+      expect(globalStubs["EthWalletManager.sendClaimBatch"].callCount).to.equal(1, "one batch transaction expected");
+      expect(globalStubs["EthWalletManager.sendClaimBatch"].firstCall.args[0].map((c: EthClaimInfo) => c.session)).to.deep.equal([claims[0].session, claims[1].session]);
+      expect(globalStubs["EthWalletManager.sendClaimTx"].callCount).to.equal(0, "the third claim waits for the batch's receipt: one transaction in flight");
+      expect(claims.map((c) => c.claim.claimStatus)).to.deep.equal([ClaimTxStatus.PENDING, ClaimTxStatus.PENDING, ClaimTxStatus.QUEUE]);
+      expect(claimManager.getTransactionQueue().length).to.equal(3, "all claims listed in the queue status");
+      expect(claimManager.getLastProcessedClaimIdx()).to.equal(claims[1].claim.claimIdx);
+    });
+
+    it("keeps one batch transaction in flight while the wallet is delegated, whatever ethMaxPending says", async () => {
+      let claimManager = ServiceManager.GetService(EthClaimManager);
+      await claimManager.initialize();
+      faucetConfig.ethMaxPending = 12;
+      useBatchTemplate(2, 0);
+      let claims = await queueClaims(claimManager, 5);
+      let settleFirst: (result: any) => void;
+      globalStubs["EthWalletManager.sendClaimBatch"].returns(Promise.resolve({ txHash: TX_HASH, txPromise: new Promise((resolve) => { settleFirst = resolve; }), plan: null }));
+
+      await claimManager.processQueue();
+      expect(globalStubs["EthWalletManager.sendClaimBatch"].callCount).to.equal(1, "the pool takes one in-flight transaction from a delegated account");
+      expect(claims.slice(0, 2).map((c) => c.claim.claimStatus)).to.deep.equal([ClaimTxStatus.PENDING, ClaimTxStatus.PENDING]);
+      expect(claims.slice(2).map((c) => c.claim.claimStatus)).to.deep.equal([ClaimTxStatus.QUEUE, ClaimTxStatus.QUEUE, ClaimTxStatus.QUEUE], "the rest waits for the receipt");
+
+      await claimManager.processQueue();
+      expect(globalStubs["EthWalletManager.sendClaimBatch"].callCount).to.equal(1, "still one while the first is unmined");
+
+      // the first batch is mined: the next one goes out
+      globalStubs["evaluateClaimReceipt"] = sinon.stub(EthWalletManager.prototype, "evaluateClaimReceipt").returns({ executed: true, outcomes: new Map() });
+      settleFirst({ status: true, block: 1, fee: 0n, receipt: { status: true, logs: [] } });
+      await awaitSleepPromise(2000, () => claims[0].claim.claimStatus === ClaimTxStatus.CONFIRMED);
+      globalStubs["EthWalletManager.sendClaimBatch"].returns(Promise.resolve({ txHash: TX_HASH.replace(/a$/, "c"), txPromise: new Promise(() => {}), plan: null }));
+      await claimManager.processQueue();
+      expect(globalStubs["EthWalletManager.sendClaimBatch"].callCount).to.equal(2, "the second batch follows the first's receipt");
+    });
+
+    it("queues a batch the fee cap refuses in the planning stage again, in the size that fits", async () => {
+      let claimManager = ServiceManager.GetService(EthClaimManager);
+      await claimManager.initialize();
+      useBatchTemplate(3, 0);
+      let claims = await queueClaims(claimManager, 3);
+      globalStubs["EthWalletManager.sendClaimBatch"].onFirstCall().returns(Promise.reject(new BatchTooExpensiveError(3, 300000, 1)));
+      globalStubs["EthWalletManager.sendClaimTx"].returns(Promise.resolve({ txHash: TX_HASH, txPromise: new Promise(() => {}), plan: null }));
+
+      await claimManager.processQueue();
+      expect(globalStubs["EthWalletManager.sendClaimBatch"].callCount).to.equal(1, "the plan of three was refused");
+      expect(claims.map((c) => c.claim.claimStatus)).to.deep.equal([ClaimTxStatus.QUEUE, ClaimTxStatus.QUEUE, ClaimTxStatus.QUEUE], "nothing failed, nothing signed");
+
+      await claimManager.processQueue();
+      expect(globalStubs["EthWalletManager.sendClaimTx"].callCount).to.equal(1, "one claim fits: the first goes alone");
+      expect(globalStubs["EthWalletManager.sendClaimTx"].firstCall.args[0].session).to.equal(claims[0].session);
+      expect(claims.map((c) => c.claim.claimStatus)).to.deep.equal([ClaimTxStatus.PENDING, ClaimTxStatus.QUEUE, ClaimTxStatus.QUEUE]);
+    });
+
+    it("waits maxWaitSeconds for a partial batch, then sends it", async () => {
+      let claimManager = ServiceManager.GetService(EthClaimManager);
+      await claimManager.initialize();
+      useBatchTemplate(3, 10);
+      let claims = await queueClaims(claimManager, 1);
+      globalStubs["EthWalletManager.sendClaimTx"].returns(Promise.resolve({ txHash: TX_HASH, txPromise: new Promise(() => {}), plan: null }));
+
+      await claimManager.processQueue();
+      expect(globalStubs["EthWalletManager.sendClaimTx"].callCount).to.equal(0, "a fresh partial batch waits");
+      expect(claims[0].claim.claimStatus).to.equal(ClaimTxStatus.QUEUE);
+
+      claims[0].claim.claimTime -= 20;
+      await claimManager.processQueue();
+      expect(globalStubs["EthWalletManager.sendClaimTx"].callCount).to.equal(1, "the aged partial batch is sent");
+      expect(claims[0].claim.claimStatus).to.equal(ClaimTxStatus.PENDING);
+    });
+
+    it("settles a batch from its receipt: fee split and per-recipient failure", async () => {
+      let claimManager = ServiceManager.GetService(EthClaimManager);
+      await claimManager.initialize();
+      useBatchTemplate(2, 0);
+      let claims = await queueClaims(claimManager, 2);
+      let claimFuse = createFuse();
+      globalStubs["EthWalletManager.sendClaimBatch"].returns(Promise.resolve({
+        txHash: TX_HASH,
+        txPromise: fusedSleep(claimFuse, 500).then(() => ({ status: true, block: 77, fee: 101n, receipt: getTestReceipt() })),
+        plan: null,
+      }));
+      // the batcher reported the second claim's only call as unpaid
+      globalStubs["evaluateClaimReceipt"] = sinon.stub(EthWalletManager.prototype, "evaluateClaimReceipt").returns({ executed: true, outcomes: new Map([[0, { failed: 0, total: 1 }], [1, { failed: 1, total: 1 }]]) });
+
+      await claimManager.processQueue();
+      expect(claims.map((c) => c.claim.claimStatus)).to.deep.equal([ClaimTxStatus.PENDING, ClaimTxStatus.PENDING]);
+
+      claimFuse();
+      await awaitSleepPromise(1000, () => claims[0].claim.claimStatus === ClaimTxStatus.CONFIRMED && claims[1].claim.claimStatus === ClaimTxStatus.FAILED);
+      expect(claims[0].claim.claimStatus).to.equal(ClaimTxStatus.CONFIRMED, "paid claim should confirm");
+      expect(claims[0].claim.txBlock).to.equal(77);
+      expect(claims[0].claim.txFee).to.equal("51", "first claim carries the fee remainder");
+      expect(claims[1].claim.claimStatus).to.equal(ClaimTxStatus.FAILED, "claim the contract reported as failed should fail");
+      expect(claims[1].claim.txError).to.match(/payout to this address failed/);
+      expect(claims[1].claim.txFee).to.equal("50");
+      expect(claimManager.getTransactionQueue().length).to.equal(2, "both stay listed in the history");
+      expect(claimManager.getTransactionQueue(true).length).to.equal(0, "nothing queued or pending");
+    });
+
+    it("fails every claim of a reverted batch", async () => {
+      let claimManager = ServiceManager.GetService(EthClaimManager);
+      await claimManager.initialize();
+      useBatchTemplate(2, 0);
+      let claims = await queueClaims(claimManager, 2);
+      let claimFuse = createFuse();
+      globalStubs["EthWalletManager.sendClaimBatch"].returns(Promise.resolve({
+        txHash: TX_HASH,
+        txPromise: fusedSleep(claimFuse, 500).then(() => ({ status: false, block: 77, fee: 100n, receipt: getTestReceipt() })),
+        plan: null,
+      }));
+
+      await claimManager.processQueue();
+      claimFuse();
+      await awaitSleepPromise(1000, () => claims.every((c) => c.claim.claimStatus === ClaimTxStatus.FAILED));
+      expect(claims.map((c) => c.claim.claimStatus)).to.deep.equal([ClaimTxStatus.FAILED, ClaimTxStatus.FAILED]);
+      expect(claims[0].claim.txError).to.match(/transaction reverted/);
+    });
+
+    it("restores pending claims of one transaction as one batch", async () => {
+      let claimTime = Math.floor(new Date().getTime() / 1000);
+      let ses1 = await addTestSession(FaucetSessionStatus.CLAIMING, { claimIdx: 1, claimStatus: ClaimTxStatus.PENDING, claimTime, txHash: TX_HASH, txNonce: 5 }, "100");
+      let ses2 = await addTestSession(FaucetSessionStatus.CLAIMING, { claimIdx: 2, claimStatus: ClaimTxStatus.PENDING, claimTime, txHash: TX_HASH, txNonce: 5 }, "200");
+      let claimFuse = createFuse();
+      globalStubs["watchClaimTx"] = sinon.stub(EthWalletManager.prototype, "watchClaimTx").returns(
+        fusedSleep(claimFuse, 500).then(() => ({ status: true, block: 78, fee: 90n, receipt: getTestReceipt() }))
+      );
+
+      let claimManager = ServiceManager.GetService(EthClaimManager);
+      await claimManager.initialize();
+      expect(globalStubs["watchClaimTx"].callCount).to.equal(1, "one watcher per transaction hash");
+      expect(claimManager.getTransactionQueue().length).to.equal(2);
+
+      claimFuse();
+      let restored = claimManager.getTransactionQueue();
+      await awaitSleepPromise(1000, () => restored.every((c) => c.claim.claimStatus === ClaimTxStatus.CONFIRMED));
+      expect(restored.map((c) => c.claim.claimStatus)).to.deep.equal([ClaimTxStatus.CONFIRMED, ClaimTxStatus.CONFIRMED]);
+      expect(restored.map((c) => c.claim.txFee).sort()).to.deep.equal(["45", "45"]);
+      expect([ses1.sessionId, ses2.sessionId].sort()).to.deep.equal(restored.map((c) => c.session).sort());
+    });
+  });
+
+});

@@ -1,0 +1,36 @@
+{
+	"compilerOptions": {
+		// Target latest version of ECMAScript.
+		"target": "esnext",
+		// path to output directory
+		"outDir": "./dist/",
+		// Search under node_modules for non-relative imports.
+		"moduleResolution": "bundler",
+		// Process & infer types from .js files.
+		"allowJs": true,
+		// Don't emit; babel-loader transpiles, tsc only type-checks (TS 7 would otherwise
+		// need a rootDir covering ../libs and refuse to overwrite its .cjs inputs)
+		"noEmit": true,
+		// TS 7 defaults to strict and to rootDir = this directory; the client is not strict-clean and
+		// imports the wasm wrappers from ../libs
+		"strict": false,
+		"rootDir": "..",
+		// Import non-ES modules as default imports.
+		"esModuleInterop": true,
+		// use typescript to transpile jsx to js
+		"jsx": "react",
+		
+		"lib": [
+			"esnext",
+			"dom",
+			"dom.iterable"
+		],
+		"module": "ESNext",
+		"removeComments": true,
+		"alwaysStrict": true,
+		"importHelpers": true,
+		"skipLibCheck": true
+	},
+	// only the client sources; the webpack config and build script are plain node scripts
+	"include": ["src"]
+}

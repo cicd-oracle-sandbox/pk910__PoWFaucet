@@ -1,0 +1,522 @@
+import React, { ReactElement } from 'react';
+import { HashRouter as Router, Routes, Route, Link, useLocation } from "react-router";
+
+import { FaucetApi } from '../common/FaucetApi';
+import { IFaucetConfig, IFaucetStatus } from '../common/FaucetConfig';
+import { IFaucetContext, IFaucetContextUrls, IPageHeader } from '../common/FaucetContext';
+import { FaucetNotification } from './shared/FaucetNotification';
+import { FaucetDialog, IFaucetDialogProps } from './shared/FaucetDialog';
+
+import FrontPage from './frontpage/FrontPage';
+import MiningPage from './mining/MiningPage';
+import ClaimPage from './claim/ClaimPage';
+import DetailsPage from './details/DetailsPage';
+import FaucetStatusPage from './status/FaucetStatusPage';
+import QueueStatusPage from './status/QueueStatusPage';
+import { getCoreFlags } from '../sdk/flags';
+import { getRoutes } from '../sdk/slots';
+import { publishFaucetConfig, publishFaucetContext } from '../sdk/sdk';
+import { emitHookSafe } from '../sdk/hooks';
+import { SlotOutlet } from '../sdk/SlotOutlet';
+
+import './FaucetPage.scss'
+import { PoWMinerWorkerSrc, getPoWMinerDefaultSrc } from '../types/PoWMinerSrc';
+import { toReadableAmount } from '../utils/ConvertHelpers';
+import { joinUrl } from '../utils/QueryUtils';
+
+export interface IFaucetPageProps {
+  baseUrl?: string; // base url (default: "/")
+  apiUrl?: string;  // api url  (default: "{baseUrl}/api")
+  wsBaseUrl?: string; // ws url (default: "{baseUrl}/ws")
+  imagesUrl?: string; // images (default: "{baseUrl}/images")
+  minerSrc?: PoWMinerWorkerSrc;
+  children?: ReactElement | ReactElement[];
+  ref?: (ref: FaucetPage) => void;
+}
+
+export interface IFaucetPageState {
+  initializing: boolean;
+  faucetConfig: IFaucetConfig;
+  faucetStatus: IFaucetStatus[];
+  statusAlerts: IFaucetStatusAlert[];
+  dialogs: IFaucetDialog[];
+  notifications: IFaucetNotification[];
+  pageHeader: IPageHeader | null;
+}
+
+export interface IFaucetNotification {
+  id: number;
+  type: string;
+  message: string;
+  time?: number;
+  timeout?: number;
+  timerId?: ReturnType<typeof setTimeout>;
+}
+
+export interface IFaucetDialog {
+  id: number;
+  dialog: IFaucetDialogProps;
+  closeFn: () => void;
+}
+
+export interface IFaucetStatusAlert {
+  id: number;
+  body: React.ReactElement;
+  level: string;
+  prio: number;
+}
+
+export const FaucetPageContext = React.createContext<IFaucetContext>(null);
+export const FaucetConfigContext = React.createContext<IFaucetConfig>(null);
+
+/**
+ * A route only a developer may see.
+ *
+ * The check is **inside** the router's subtree on purpose. The obvious version -
+ * filtering the route list where it is built - reads the flag in `FaucetPage`'s
+ * own render, and `FaucetPage` does not re-render when the router navigates: the
+ * list is whatever it was when the page first rendered, so arriving at
+ * `#/route?dev=1` from a page that started without the flag produced a route
+ * that existed in the registry, matched the path, and was not in the tree. It
+ * took three wrong diagnoses - the flag parser, the query in the hash, the
+ * plugin's script - before the frozen list was the answer.
+ *
+ * Rendered here, the condition is asked again on every navigation, which is when
+ * it can change.
+ */
+function DevOnlyRoute(props: { children: React.ReactNode }): React.ReactElement {
+  // `useLocation` is what makes this re-run. The flag lives in the URL, and the
+  // URL is the router's state: without reading it through the router, React has
+  // no reason to render this again when only the query changes - the path is the
+  // same `/route` it already matched, so the element it built stays as it was.
+  // That is the second half of the same lesson, and it cost the same hour.
+  useLocation();
+  if(!getCoreFlags().dev)
+    return null;
+  return <React.Fragment>{props.children}</React.Fragment>;
+}
+
+/** Emits the `page` hook whenever the router's location changes; renders nothing. */
+function PageHookObserver(): null {
+  let location = useLocation();
+  React.useEffect(() => {
+    emitHookSafe("page", { path: location.pathname });
+  }, [location.pathname]);
+  return null;
+}
+
+export class FaucetPage extends React.PureComponent<IFaucetPageProps, IFaucetPageState> {
+  private configRefreshInterval: ReturnType<typeof setInterval>;
+  private faucetContainerElement: HTMLElement;
+  private lastConfigRefresh = 0;
+  private lastConfigRefreshStart = 0;
+  private statusAlertIdCounter = 0;
+  private notificationIdCounter = 0;
+  private dialogIdCounter = 0;
+  private notifications: IFaucetNotification[] = [];
+  private dialogs: IFaucetDialog[] = [];
+  private statusAlerts: IFaucetStatusAlert[] = [];
+  private pageContext: IFaucetContext;
+  private faucetStatucClickCount = 0;
+
+  constructor(props: IFaucetPageProps) {
+    super(props);
+
+    let baseUrl = props.baseUrl || "/";
+    let faucetApi = new FaucetApi(props.apiUrl || joinUrl(baseUrl, "/api"));
+    this.pageContext = {
+      faucetUrls: {
+        baseUrl: baseUrl,
+        apiUrl: props.apiUrl || joinUrl(baseUrl, "/api"),
+        wsBaseUrl: props.wsBaseUrl || joinUrl(baseUrl.replace(/^http/, "ws"), "/ws"),
+        minerSrc: props.minerSrc || getPoWMinerDefaultSrc(baseUrl),
+        imagesUrl: props.imagesUrl || joinUrl(baseUrl, "/images"),
+      },
+      faucetApi: faucetApi,
+      showStatusAlert: (level: string, prio: number, body: React.ReactElement) => this.showStatusAlert(level, prio, body),
+      hideStatusAlert: (statusAlertId: number) => this.hideStatusAlert(statusAlertId),
+      showNotification: (type: string, message: string, time?: number|boolean, timeout?: number) => this.showNotification(type, message, time, timeout),
+      hideNotification: (notificationId: number) => this.hideNotification(notificationId),
+      showDialog: (dialogProps: IFaucetDialogProps) => this.showDialog(dialogProps),
+      hideDialog: (dialogId: number) => this.hideDialog(dialogId),
+      getContainer: () => this.faucetContainerElement,
+      refreshConfig: () => this.loadFaucetConfig(),
+      setPageHeader: (header) => this.setState({ pageHeader: header }),
+    };
+    // the modules' `api` and `session` accessors read the page's context; published once, never by a module
+    publishFaucetContext(this.pageContext);
+
+    this.state = {
+      initializing: true,
+      faucetConfig: null,
+      faucetStatus: [],
+      statusAlerts: [],
+      dialogs: [],
+      notifications: [],
+      pageHeader: null,
+		};
+
+    if(props.ref) {
+      props.ref(this);
+    }
+  }
+
+  public componentDidMount() {
+    this.loadFaucetConfig();
+    this.startConfigRefreshInterval();  
+  }
+
+  public componentWillUnmount() {
+    if(this.configRefreshInterval) {
+      clearInterval(this.configRefreshInterval);
+      this.configRefreshInterval = null;
+    }
+  }
+
+  private startConfigRefreshInterval() {
+    if(this.configRefreshInterval)
+      clearInterval(this.configRefreshInterval);
+    this.configRefreshInterval = setInterval(() => {
+      let now = (new Date()).getTime();
+      if(this.lastConfigRefresh < now - (10 * 60 * 1000)) {
+        this.loadFaucetConfig();
+      }
+    }, 30 * 1000);
+  }
+
+  private loadFaucetConfig() {
+    let now = (new Date()).getTime();
+    if(now - this.lastConfigRefreshStart < 10000)
+      return;
+    this.lastConfigRefreshStart = now;
+
+    this.pageContext.faucetApi.getFaucetConfig().then((faucetConfig) => {
+      this.lastConfigRefresh = (new Date()).getTime();
+      // ...and to the modules, who read their own block through
+      // `PoWFaucet.config.module(name)` rather than being handed the whole of it
+      // Published on every refresh, so a module that asks late gets what
+      // the page has now.
+      publishFaucetConfig(faucetConfig);
+      emitHookSafe("config", { config: faucetConfig });
+      this.setState({
+        initializing: false,
+        faucetConfig: faucetConfig,
+        faucetStatus: faucetConfig.faucetStatus,
+      });
+    });
+  }
+
+	public render(): React.ReactElement<IFaucetPageProps> {
+    if(this.state.initializing) {
+      return (
+        <div className="faucet-loading">
+          <div className="loading-spinner">
+            <img src={(this.pageContext.faucetUrls.imagesUrl || "/images") + "/spinner.gif"} className="spinner" />
+            <span className="spinner-text">Loading...</span>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div className='faucet-page' data-bs-theme="light" ref={(ref) => {
+        this.faucetContainerElement = ref;
+      }}>
+        <FaucetConfigContext.Provider value={this.state.faucetConfig}>
+          <FaucetPageContext.Provider value={this.pageContext}>
+            {this.renderTitle()}
+            <SlotOutlet slot="header" faucetConfig={this.state.faucetConfig} navigate={(path) => { location.hash = path; }} />
+            {this.renderStatusAlerts()}
+            <div className="faucet-body">
+              {this.props.children && (!Array.isArray(this.props.children) || this.props.children.length > 0) ? this.props.children :
+              <Router>
+                <PageHookObserver />
+                <Routes>
+                  <Route
+                    path='/'
+                    element={(
+                      <FrontPage />
+                    )}
+                  />
+                  <Route
+                    path='/mine/:session'
+                    element={(
+                      <MiningPage />
+                    )}
+                  />
+                  <Route
+                    path='/claim/:session'
+                    element={(
+                      <ClaimPage />
+                    )}
+                  />
+                  <Route
+                    path='/details/:session'
+                    element={(
+                      <DetailsPage />
+                    )}
+                  />
+                  <Route
+                    path='/status'
+                    element={(
+                      <FaucetStatusPage />
+                    )}
+                  />
+                  <Route
+                    path='/queue'
+                    element={(
+                      <QueueStatusPage />
+                    )}
+                  />
+                  {/*
+                    * Whatever a module registered. A `{dev: true}` route
+                    * exists only for a developer - the same condition the first
+                    * dev entry was written with, now asked of the page
+                    * rather than of a module.
+                    */}
+                  {getRoutes().map((route) => (
+                    <Route
+                      key={route.path}
+                      path={route.path}
+                      element={route.dev
+                        ? <DevOnlyRoute><route.component /></DevOnlyRoute>
+                        : <route.component />}
+                    />
+                  ))}
+                </Routes>
+              </Router>
+              }
+            </div>
+            {this.renderDialogs()}
+            {this.renderNotifications()}
+            <SlotOutlet slot="footer" faucetConfig={this.state.faucetConfig} navigate={(path) => { location.hash = path; }} />
+            <div className='faucet-footer'>
+              <span className="faucet-client-version">PoWFaucet client v{FAUCET_CLIENT_VERSION}</span>
+              <a href="https://github.com/pk910/PoWFaucet" target="_blank" rel="noopener noreferrer">Source on GitHub</a>
+            </div>
+          </FaucetPageContext.Provider>
+        </FaucetConfigContext.Provider>
+      </div>
+    );
+	}
+
+  /**
+   * The card's one header: the faucet's title and claim range, or what the page put there
+   * (its own title, a meta line, a status pill at the right).
+   */
+  private renderTitle(): React.ReactElement {
+    let config = this.state.faucetConfig;
+    let header = this.state.pageHeader || {};
+    let meta = header.meta;
+    if(meta === undefined && config.maxClaim) {
+      let parts = ["Up to " + toReadableAmount(config.maxClaim, config.faucetCoinDecimals, config.faucetCoinSymbol) + " per session"];
+      if(config.minClaim)
+        parts.push("minimum claim " + toReadableAmount(config.minClaim, config.faucetCoinDecimals, config.faucetCoinSymbol));
+      meta = parts.join(" \u00b7 ");
+    }
+    return (
+      <div className="faucet-title">
+        <div className="faucet-title-text">
+          <h1>{header.title || config.faucetTitle}</h1>
+          {meta ? <p className="faucet-meta">{meta}</p> : null}
+        </div>
+        {header.pill ?
+          <span className={"pf-pill" + (header.pill.kind ? " pf-pill-" + header.pill.kind : "")}>{header.pill.text}</span>
+        : null}
+        <div className="faucet-status-link" onClick={() => this.onFaucetStatusClick()}></div>
+      </div>
+    );
+  }
+
+  private renderStatusAlerts(): React.ReactElement {
+    let faucetStatusEntries = [];
+    Array.prototype.push.apply(faucetStatusEntries, this.state.faucetStatus);
+    Array.prototype.push.apply(faucetStatusEntries, this.state.statusAlerts);
+    faucetStatusEntries.sort((a, b) => (a.prio || 10) - (b.prio || 10));
+
+    return (
+      <div className="faucet-status-alerts">
+        {faucetStatusEntries.map((status, idx) => {
+          let faucetStatusClass: string = "";
+          switch(status.level) {
+            case "info":
+              faucetStatusClass = "alert-info";
+              break;
+            case "warn":
+              faucetStatusClass = "alert-warning";
+              break;
+            case "error":
+              faucetStatusClass = "alert-danger";
+              break;
+            default:
+              faucetStatusClass = "alert-light";
+              break;
+          }
+          return (
+            <div key={"status" + idx} className={["faucet-status-alert alert", faucetStatusClass].join(" ")} role="alert">
+              {status.body ? status.body : status.ishtml ? 
+                <div dangerouslySetInnerHTML={{__html: status.text}} /> :
+                <span>{status.text}</span>
+              }
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  private showStatusAlert(level: string, prio: number, body: React.ReactElement): number {
+    let statusAlertId = this.statusAlertIdCounter++;
+    let statusAlert: IFaucetStatusAlert = {
+      id: statusAlertId,
+      level: level,
+      prio: prio,
+      body: body,
+    }
+    this.statusAlerts.push(statusAlert);
+    this.setState({
+      statusAlerts: this.statusAlerts.slice()
+    })
+    return statusAlertId;
+  }
+
+  private hideStatusAlert(statusAlertId: number): void {
+    let statusAlertIdx = -1;
+    let statusAlert: IFaucetStatusAlert;
+    for(let idx = 0; idx < this.state.statusAlerts.length; idx++) {
+      if(this.statusAlerts[idx].id === statusAlertId) {
+        statusAlertIdx = idx;
+        statusAlert = this.state.statusAlerts[idx];
+        break;
+      }
+    }
+    if(statusAlertIdx !== -1) {
+      this.statusAlerts.splice(statusAlertIdx, 1);
+      this.setState({
+        statusAlerts: this.statusAlerts.slice()
+      });
+    }
+  }
+
+  private renderNotifications(): React.ReactElement {
+    return (
+      <div className='faucet-notifications'>
+        {this.state.notifications.map((notification) => (
+          <FaucetNotification 
+            key={notification.id} 
+            type={notification.type} 
+            message={notification.message} 
+            time={notification.time} 
+            hideFn={() => this.hideNotification(notification.id)} 
+          />
+        ))}
+      </div>
+    );
+  }
+
+  private showNotification(type: string, message: string, time?: number|boolean, timeout?: number): number {
+    let notificationId = this.notificationIdCounter++;
+    let notification: IFaucetNotification = {
+      id: notificationId,
+      type: type,
+      message: message,
+      time: typeof time == "number" ? time : time ? (new Date()).getTime() : null,
+      timeout: timeout ? (new Date()).getTime() + timeout : 0,
+      timerId: timeout ? setTimeout(() => {
+        notification.timerId = null;
+        this.hideNotification(notification.id);
+      }, timeout) : null,
+    }
+    if(this.notifications.length > 10) {
+      this.notifications.splice(0, this.notifications.length - 10).forEach((n) => {
+        if(n.timerId) {
+          clearTimeout(n.timerId);
+          n.timerId = null;
+        }
+      });
+    }
+    this.notifications.push(notification);
+    this.setState({
+      notifications: this.notifications.slice()
+    })
+    return notificationId;
+  }
+
+  private hideNotification(notificationId: number): void {
+    let notificationIdx = -1;
+    let notification: IFaucetNotification;
+    for(let idx = 0; idx < this.state.notifications.length; idx++) {
+      if(this.notifications[idx].id === notificationId) {
+        notificationIdx = idx;
+        notification = this.state.notifications[idx];
+        break;
+      }
+    }
+    if(notificationIdx !== -1) {
+      if(notification.timerId) {
+        clearTimeout(notification.timerId);
+        notification.timerId = null;
+      }
+
+      this.notifications.splice(notificationIdx, 1);
+      this.setState({
+        notifications: this.notifications.slice()
+      });
+    }
+  }
+
+  private renderDialogs(): React.ReactElement[] {
+    return this.state.dialogs.map((dialog) => (
+      <FaucetDialog 
+        key={dialog.id} 
+        {...dialog.dialog}
+        container={this.faucetContainerElement}
+      />
+    ));
+  }
+
+  private showDialog(dialogProps: IFaucetDialogProps): number {
+    let dialogId = this.dialogIdCounter++;
+    let dialog: IFaucetDialog = {
+      id: dialogId,
+      dialog: {
+        ...dialogProps,
+        closeFn: () => this.hideDialog(dialogId),
+      },
+      closeFn: dialogProps.closeFn,
+    }
+    this.dialogs.push(dialog);
+    this.setState({
+      dialogs: this.dialogs.slice()
+    })
+    return dialogId;
+  }
+
+  private hideDialog(dialogId: number): void {
+    let dialogIdx = -1;
+    let dialog: IFaucetDialog;
+    for(let idx = 0; idx < this.dialogs.length; idx++) {
+      if(this.dialogs[idx].id === dialogId) {
+        dialogIdx = idx;
+        dialog = this.dialogs[idx];
+        break;
+      }
+    }
+    if(dialog && dialogIdx !== -1) {
+      if(dialog.closeFn)
+        dialog.closeFn();
+      this.dialogs.splice(dialogIdx, 1);
+      this.setState({
+        dialogs: this.dialogs.slice()
+      });
+    }
+  }
+
+  private onFaucetStatusClick() {
+    this.faucetStatucClickCount++;
+    if(this.faucetStatucClickCount >= 10) {
+      this.faucetStatucClickCount = 0;
+      location.href = "#/status";
+    }
+  }
+
+}
