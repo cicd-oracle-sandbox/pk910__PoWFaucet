@@ -1,4 +1,4 @@
 upstream: https://github.com/pk910/PoWFaucet
 commit: 1b3282370c3b0f45f18ae27d426bbfbc5bc1aa2d
 license: AGPL-3.0
-Unmodified snapshot except that .github/workflows was emptied.
+Unmodified snapshot except that .github/workflows was emptied and .github/dependabot.yml was removed (so Dependabot does not open PRs in the sandbox).
