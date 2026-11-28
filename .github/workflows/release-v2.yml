@@ -1,0 +1,140 @@
+
+name: Release latest v2 version
+
+on:
+  workflow_dispatch:
+
+# every action is pinned to a commit sha (dependabot moves the sha and the version comment); the
+# GITHUB_TOKEN is read-only unless a job says otherwise
+permissions:
+  contents: read
+
+jobs:
+  run_tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 24
+        cache: npm
+
+    - run: npm ci
+    - run: npm run test
+
+  build_binaries:
+    name: Build Binaries
+    needs: [run_tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    # setup global dependencies
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 24
+        cache: npm
+        registry-url: "https://registry.npmjs.org"
+    # @yao-pkg/pkg is the maintained fork of vercel/pkg (archived 2024, node 18 only)
+    - run: npm install -g @yao-pkg/pkg@6.23.0
+
+    # build server project
+    - run: |
+        npm ci
+        npm run bundle
+
+    # build client project
+    - run: |
+        cd faucet-client
+        npm ci
+        node ./build-client.js
+
+    # publish npm packages: @powfaucet/server (the runnable faucet) and @powfaucet/sdk (what a
+    # module builds against). A version that is already on the registry is skipped, so a re-run of
+    # this workflow is harmless; anything else that goes wrong fails the job instead of being hidden.
+    # Auth: npm trusted publishing - this workflow is registered as the trusted publisher of both
+    # packages on npmjs.com, so the job's OIDC token (`id-token: write`) is the credential and no
+    # secret is involved; `--provenance` attaches the build attestation. Needs npm >= 11.5.
+    - name: Publish npm packages
+      run: |
+        npm install -g npm@latest
+        npm run sdk
+        publish_one() {
+          local dir="$1" name version
+          name="$(node -p "require('./$dir/package.json').name")"
+          version="$(node -p "require('./$dir/package.json').version")"
+          if npm view "$name@$version" version > /dev/null 2>&1; then
+            echo "$name@$version is already published - skipping"
+            return 0
+          fi
+          (cd "$dir" && npm publish --access public --provenance)
+        }
+        publish_one .
+        publish_one sdk-dist
+
+    # package bundled release
+    - name: Package bundled release
+      run: |
+        mv res/run-faucet.* ./
+        chmod +x ./run-faucet.sh
+        tar cfz powfaucet-server-all.tar.gz bundle static faucet-config.example.yaml run-faucet.sh
+        zip -r powfaucet-server-all.zip bundle static faucet-config.example.yaml run-faucet.bat
+
+    # package static folder
+    - name: Package static folder
+      run: |
+        tar cfz powfaucet-static.tar.gz static
+        zip -r powfaucet-static.zip static
+
+    # build binaries (the asset name is the file name, so rename pkg's output here)
+    - run: |
+        pkg --compress Brotli --options no-warnings .
+        mv bin/server-linux powfaucet-server-linux
+        mv bin/server-win.exe powfaucet-server-win.exe
+
+    # collect metadata
+    - name: Get project versions
+      run: |
+        echo "server_version=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
+        echo "client_version=$(jq -r .version faucet-client/package.json)" >> "$GITHUB_OUTPUT"
+      id: version
+
+    # create draft release with the gh cli (the create-release / upload-release-asset actions this
+    # used before are archived)
+    - name: Create draft release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SERVER_VERSION: ${{ steps.version.outputs.server_version }}
+      run: |
+        cat > release-notes.md <<NOTES
+        ### Major Changes
+        ...
+
+        ### Release Artifacts
+        | Release File  | Description |
+        | ------------- | ------------- |
+        | powfaucet-server-all [.tar.gz](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/v${SERVER_VERSION}/powfaucet-server-all.tar.gz) / [.zip](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/v${SERVER_VERSION}/powfaucet-server-all.zip) | PoWFaucet server for execution with local nodejs (recommended) |
+        | [powfaucet-server-win.exe](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/v${SERVER_VERSION}/powfaucet-server-win.exe) | PoWFaucet all-in-one executable for windows (NodeJS 24, 64bit) |
+        | [powfaucet-server-linux](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/v${SERVER_VERSION}/powfaucet-server-linux) | PoWFaucet all-in-one executable for linux (NodeJS 24, 64bit) |
+        | powfaucet-static [.tar.gz](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/v${SERVER_VERSION}/powfaucet-static.tar.gz) / [.zip](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/v${SERVER_VERSION}/powfaucet-static.zip) | PoWFaucet static folder (optional, see [Operator Wiki](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/wiki/Operator-Wiki)) |
+        NOTES
+        gh release create "v${SERVER_VERSION}" \
+          --draft \
+          --target "${GITHUB_SHA}" \
+          --title "v${SERVER_VERSION}" \
+          --notes-file release-notes.md \
+          powfaucet-server-linux \
+          powfaucet-server-win.exe \
+          powfaucet-server-all.tar.gz \
+          powfaucet-server-all.zip \
+          powfaucet-static.tar.gz \
+          powfaucet-static.zip
