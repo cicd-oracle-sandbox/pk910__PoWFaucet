@@ -1,0 +1,153 @@
+name: Build latest master version
+
+on:
+  push:
+    branches:
+      - 'master'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# every action is pinned to a commit sha (dependabot moves the sha and the version comment); the
+# GITHUB_TOKEN is read-only unless a job says otherwise
+permissions:
+  contents: read
+
+jobs:
+  run_tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 24
+        cache: npm
+
+    - run: npm ci
+    - run: npm run test-coverage
+
+    - name: Upload coverage reports to Codecov
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+
+  browser_tests:
+    name: Browser Tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 24
+        cache: npm
+
+    - run: npm ci
+
+    # the suite drives the real client bundle, so the client is built first
+    - run: |
+        cd faucet-client
+        npm ci
+        node ./build-client.js
+
+    # the chromium build matching the playwright devDependency
+    - run: npx playwright install --with-deps chromium
+
+    - run: npm run test-browser
+
+  build_binaries:
+    name: Build Binaries
+    needs: [ run_tests ]
+    runs-on: ubuntu-latest
+    # recreates the "snapshot" tag and release
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    # setup global dependencies
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 24
+        cache: npm
+    # @yao-pkg/pkg is the maintained fork of vercel/pkg (archived 2024, node 18 only)
+    - run: npm install -g @yao-pkg/pkg@6.23.0
+
+    # build server project
+    - run: |
+        npm ci
+        npm run bundle
+
+    # build client project
+    - run: |
+        cd faucet-client
+        npm ci
+        node ./build-client.js
+
+    # package bundled release
+    - name: Package bundled release
+      run: |
+        mv res/run-faucet.* ./
+        chmod +x ./run-faucet.sh
+        tar cfz powfaucet-server-all.tar.gz bundle static faucet-config.example.yaml run-faucet.sh
+        zip -r powfaucet-server-all.zip bundle static faucet-config.example.yaml run-faucet.bat
+
+    # package static folder
+    - name: Package static folder
+      run: |
+        tar cfz powfaucet-static.tar.gz static
+        zip -r powfaucet-static.zip static
+
+    # build binaries (the asset name is the file name, so rename pkg's output here)
+    - run: |
+        pkg --compress Brotli --options no-warnings .
+        mv bin/server-linux powfaucet-server-linux
+        mv bin/server-win.exe powfaucet-server-win.exe
+
+    # collect metadata
+    - name: Get project versions
+      run: |
+        echo "server_version=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
+        echo "client_version=$(jq -r .version faucet-client/package.json)" >> "$GITHUB_OUTPUT"
+      id: version
+
+    # (re)create snapshot tag & release with the gh cli (the create-release / upload-release-asset
+    # actions this used before are archived)
+    - name: Recreate snapshot release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SERVER_VERSION: ${{ steps.version.outputs.server_version }}
+      run: |
+        gh release delete snapshot --yes --cleanup-tag || true
+        cat > release-notes.md <<NOTES
+        ## Latest automatically built v2 executables. (Unstable development snapshot)
+        Built from master branch (commit: ${GITHUB_SHA})
+
+        Please read the [Operator Wiki](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/wiki/Operator-Wiki) for setup / configuration instructions.
+
+        Server Version: ${SERVER_VERSION}
+        Client Version: ${CLIENT_VERSION}
+
+        ### Release Artifacts
+        | Release File  | Description |
+        | ------------- | ------------- |
+        | powfaucet-server-all [.tar.gz](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/snapshot/powfaucet-server-all.tar.gz) / [.zip](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/snapshot/powfaucet-server-all.zip) | PoWFaucet server for execution with local nodejs (recommended) |
+        | [powfaucet-server-win.exe](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/snapshot/powfaucet-server-win.exe) | PoWFaucet all-in-one executable for windows (NodeJS 24, 64bit) |
+        | [powfaucet-server-linux](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/snapshot/powfaucet-server-linux) | PoWFaucet all-in-one executable for linux (NodeJS 24, 64bit) |
+        | powfaucet-static [.tar.gz](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/snapshot/powfaucet-static.tar.gz) / [.zip](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/releases/download/snapshot/powfaucet-static.zip) | PoWFaucet static folder (optional, see [Operator Wiki](https://github.com/cicd-oracle-sandbox/pk910__PoWFaucet/wiki/Operator-Wiki)) |
+        NOTES
+        gh release create snapshot \
+          --prerelease \
+          --target "${GITHUB_SHA}" \
+          --title "Dev Snapshot" \
+          --notes-file release-notes.md \
+          powfaucet-server-linux \
+          powfaucet-server-win.exe \
+          powfaucet-server-all.tar.gz \
+          powfaucet-server-all.zip \
+          powfaucet-static.tar.gz \
+          powfaucet-static.zip
